@@ -88,6 +88,99 @@ export_env_vars() {
     chmod 600 "$SSH_ENV_DIR"
 }
 
+# ---------------------------------------------------------------------------- #
+#  Hydrate content from Cloudflare R2 (models / custom_nodes / user / input).   #
+#                                                                              #
+#  Runs only if the R2_* env vars are set (in the RunPod deploy dialog or a    #
+#  template), so the image behaves exactly as stock when they're absent.       #
+#                                                                              #
+#  IMPORTANT: this pulls ONLY the user-owned subdirectories that the image's   #
+#  upgrade logic already leaves untouched — it does NOT overwrite the ComfyUI  #
+#  core, which the image manages from its baked bundle. This avoids fighting   #
+#  upgrade_comfyui_if_needed / first-time setup.                               #
+# ---------------------------------------------------------------------------- #
+hydrate_from_r2() {
+    # Skip entirely unless the three required vars are present.
+    if [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ENDPOINT:-}" ]; then
+        echo "R2 env vars not set — skipping R2 hydrate (stock behaviour)."
+        return
+    fi
+
+    echo "============================================="
+    echo "  Hydrating content from Cloudflare R2"
+    echo "============================================="
+
+    # Install rclone if the image doesn't already have it.
+    if ! command -v rclone >/dev/null 2>&1; then
+        echo "rclone not found — installing..."
+        curl -fsSL https://rclone.org/install.sh | bash || {
+            echo "WARNING: rclone install failed; skipping R2 hydrate."
+            return
+        }
+    fi
+
+    # Define the rclone remote "manga-r2" entirely from env — no .conf file.
+    export RCLONE_CONFIG_MANGA_R2_TYPE="s3"
+    export RCLONE_CONFIG_MANGA_R2_PROVIDER="Cloudflare"
+    export RCLONE_CONFIG_MANGA_R2_ACCESS_KEY_ID="$RUNPOD_SECRET_R2_ACCESS_KEY_ID"
+    export RCLONE_CONFIG_MANGA_R2_SECRET_ACCESS_KEY="$RUNPOD_SECRET_R2_SECRET_ACCESS_KEY"
+    export RCLONE_CONFIG_MANGA_R2_ENDPOINT="$RUNPOD_SECRET_R2_ENDPOINT"
+    export RCLONE_CONFIG_MANGA_R2_ACL="private"
+    # If your working .conf had a region line, uncomment:
+    # export RCLONE_CONFIG_MANGA_R2_REGION="auto"
+
+    # Bucket path holding your content. Adjust R2_BUCKET_PATH via env if needed.
+    local R2_BASE="manga-r2:${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}"
+
+    # Only these user-owned subdirs are pulled. The image owns the core.
+    local SUBDIRS=("models" "custom_nodes" "user" "input")
+
+    local d
+    for d in "${SUBDIRS[@]}"; do
+        # Skip subdirs that don't exist in R2 (rclone would just no-op, but this
+        # keeps the logs clean and avoids creating empty dirs unnecessarily).
+        echo "--> Syncing $d ..."
+        mkdir -p "$COMFYUI_DIR/$d"
+        # copy (not sync) so nothing already in the pod dir is deleted; the
+        # image may have placed baked custom_nodes here that must survive.
+        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" \
+            --transfers 16 --checkers 32 \
+            --multi-thread-streams 8 --multi-thread-cutoff 50M \
+            --s3-chunk-size 64M --s3-upload-concurrency 8 \
+            --fast-list --size-only \
+            --exclude "**/__pycache__/**" \
+            --exclude "custom_nodes/*/.git/**" \
+            || echo "WARNING: sync of $d failed (continuing)."
+    done
+
+    echo "R2 hydrate complete."
+
+    # Install requirements for any custom nodes pulled from R2. Their deps are
+    # NOT in the image's system site-packages (only the baked nodes are), so
+    # this step is what makes your own nodes work. Runs inside the venv, which
+    # is activated later — so we defer the actual pip work to run_node_requirements
+    # after the venv is active. Here we just flag that a hydrate happened.
+    R2_HYDRATED=1
+}
+
+# Install requirements for user custom nodes pulled from R2 (venv must be active)
+run_node_requirements() {
+    [ "${R2_HYDRATED:-0}" = "1" ] || return
+    echo "Installing requirements for R2-provided custom nodes..."
+    local req node
+    for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
+        [ -f "$req" ] || continue
+        node=$(basename "$(dirname "$req")")
+        # Skip image-managed nodes; their deps are already in the image.
+        case " ${BAKED_NODES[*]} " in
+            *" $node "*) continue ;;
+        esac
+        echo "  - $node"
+        pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    done
+    echo "Custom-node requirements install complete."
+}
+
 # Start Jupyter Lab server for remote access
 start_jupyter() {
     mkdir -p /workspace
@@ -226,13 +319,13 @@ if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
     source "$VENV_DIR/bin/activate"
     python -m ensurepip
     # Skip nodes baked into the image — their deps are in system site-packages
-    BAKED_NODES="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
+    BAKED_NODES_STR="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
     CURRENT=0
     INSTALLED=0
     for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
         if [ -f "$req" ]; then
             NODE_NAME=$(basename "$(dirname "$req")")
-            case " $BAKED_NODES " in
+            case " $BAKED_NODES_STR " in
                 *" $NODE_NAME "*) continue ;;
             esac
             CURRENT=$((CURRENT + 1))
@@ -275,6 +368,14 @@ else
     source "$VENV_DIR/bin/activate"
     echo "Using existing ComfyUI installation"
 fi
+
+# ---- R2 hydrate: pull user content, then install its custom-node deps -------
+# Placed AFTER ComfyUI setup (so the dirs exist and the venv is active) and
+# BEFORE the ComfyUI launch (which blocks on `wait`). The venv is active at
+# this point via one of the branches above.
+hydrate_from_r2
+run_node_requirements
+# -----------------------------------------------------------------------------
 
 # Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
 python -m pip --version > /dev/null 2>&1
