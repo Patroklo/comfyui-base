@@ -1,7 +1,11 @@
 variable "TAG" {
   default = "slim"
 }
-
+# Docker Hub namespace/repo to push to. Single source of truth for the image
+# name — change this one line to retarget every tag below.
+variable "IMAGE_REPO" {
+  default = "patroklo838/comfyui-patroklo"
+}
 # === Version Pins (single source of truth) ===
 variable "COMFYUI_VERSION" {
   default = "v0.30.0"
@@ -44,11 +48,9 @@ variable "FILEBROWSER_VERSION" {
 variable "FILEBROWSER_SHA256" {
   default = "8cd8c3baecb086028111b912f252a6e3169737fa764b5c510139e81f9da87799"
 }
-
 group "default" {
   targets = ["common", "dev"]
 }
-
 # Common settings for all targets (defaults to regular CUDA 12.8 / cu128)
 target "common" {
   context    = "."
@@ -69,33 +71,29 @@ target "common" {
     TORCH_INDEX_SUFFIX  = "cu128"
   }
 }
-
 # Regular ComfyUI image (CUDA 12.8 — default)
 target "regular" {
   inherits = ["common"]
   tags = [
-    "runpod/comfyui:${TAG}-cuda12.8",
-    "runpod/comfyui:cuda12.8",
-    "runpod/comfyui:latest",
+    "${IMAGE_REPO}:${TAG}-cuda12.8",
+    "${IMAGE_REPO}:cuda12.8",
+    "${IMAGE_REPO}:latest",
   ]
 }
-
 # Dev image for local testing
 target "dev" {
   inherits = ["common"]
-  tags = ["runpod/comfyui:dev"]
+  tags = ["${IMAGE_REPO}:dev"]
   output = ["type=docker"]
 }
-
 # Dev push targets (for CI pushing dev tags, without overriding latest)
 target "devpush" {
   inherits = ["common"]
-  tags = ["runpod/comfyui:dev-cuda12.8"]
+  tags = ["${IMAGE_REPO}:dev-cuda12.8"]
 }
-
 target "devpush-cuda13" {
   inherits = ["common"]
-  tags = ["runpod/comfyui:dev-cuda13.0"]
+  tags = ["${IMAGE_REPO}:dev-cuda13.0"]
   args = {
     TORCH_VERSION       = TORCH_VERSION_5090
     TORCHVISION_VERSION = TORCHVISION_VERSION_5090
@@ -104,13 +102,12 @@ target "devpush-cuda13" {
     TORCH_INDEX_SUFFIX  = "cu130"
   }
 }
-
 # CUDA 13.0 image (Blackwell / RTX 5090+)
 target "cuda13" {
   inherits = ["common"]
   tags = [
-    "runpod/comfyui:${TAG}-cuda13.0",
-    "runpod/comfyui:cuda13.0",
+    "${IMAGE_REPO}:${TAG}-cuda13.0",
+    "${IMAGE_REPO}:cuda13.0",
   ]
   args = {
     TORCH_VERSION       = TORCH_VERSION_5090
