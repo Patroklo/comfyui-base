@@ -21,7 +21,7 @@ env:
 
 jobs:
   build-and-push:
-    runs-on: blacksmith-8vcpu-ubuntu-2204
+    runs-on: ubuntu-latest
     outputs:
       release-version: ${{ steps.vars.outputs.release-version }}
     steps:
@@ -62,35 +62,13 @@ jobs:
             VERSION=${GITHUB_REF#refs/tags/}
           fi
 
-          # RELEASE_VERSION feeds the bake steps' TAG env below.
+          # RELEASE_VERSION feeds the bake step's TAG env below.
           echo "RELEASE_VERSION=${VERSION}" >> $GITHUB_ENV
 
           # Hand the release version to any downstream job.
           echo "release-version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push CUDA 13.0 image
-        id: build-cuda13
-        uses: docker/bake-action@v5
-        env:
-          TAG: ${{ env.RELEASE_VERSION }}
-        with:
-          push: true
-          files: ./docker-bake.hcl
-          targets: |
-            cuda13
-
-      - name: Extract image refs
-        id: refs-cuda13
-        uses: ./.github/actions/image-name
-        with:
-          bake-metadata: ${{ steps.build-cuda13.outputs.metadata }}
-
-      - name: Clean up Docker build cache
-        run: |
-          docker builder prune -af --filter "until=1h"
-          docker system prune -af --volumes
-
-      - name: Build and push regular image
+      - name: Build and push regular image (CUDA 12.8)
         id: build-regular
         uses: docker/bake-action@v5
         env:
@@ -117,5 +95,3 @@ jobs:
           echo " - ${IMAGE_REF}:${RELEASE_VERSION}-cuda12.8 (CUDA 12.8)"
           echo " - ${IMAGE_REF}:cuda12.8"
           echo " - ${IMAGE_REF}:latest"
-          echo " - ${IMAGE_REF}:${RELEASE_VERSION}-cuda13.0 (CUDA 13.0)"
-          echo " - ${IMAGE_REF}:cuda13.0"
