@@ -89,19 +89,23 @@ export_env_vars() {
 }
 
 # ---------------------------------------------------------------------------- #
-#  Hydrate content from Cloudflare R2 (models / custom_nodes / user / input).   #
+#  Hydrate content from Cloudflare R2.                                          #
 #                                                                              #
-#  Runs only if the R2_* env vars are set (in the RunPod deploy dialog or a    #
-#  template), so the image behaves exactly as stock when they're absent.       #
-#                                                                              #
-#  IMPORTANT: this pulls ONLY the user-owned subdirectories that the image's   #
-#  upgrade logic already leaves untouched — it does NOT overwrite the ComfyUI  #
-#  core, which the image manages from its baked bundle. This avoids fighting   #
-#  upgrade_comfyui_if_needed / first-time setup.                               #
+#  The bucket is a FULL ComfyUI checkout plus extra tools, so we DON'T pull    #
+#  "everything minus core" (root files like main.py would clobber the image's  #
+#  ComfyUI). Instead we pull two explicit lists:                               #
+#    - COMFY_DATA_DIRS  -> into the ComfyUI dir (models, custom_nodes, ...)     #
+#    - SIBLING_DIRS     -> into /workspace/runpod-slim (standalone tools/LoRAs) #
+#  Add new folders to SIBLING_DIRS as you create them in the bucket.           #
 # ---------------------------------------------------------------------------- #
 hydrate_from_r2() {
-    # Skip entirely unless the three required vars are present.
-    if [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ENDPOINT:-}" ]; then
+    # Accept bare or -prefixed names.
+    local R2_KEY="${R2_ACCESS_KEY_ID:-${R2_ACCESS_KEY_ID:-}}"
+    local R2_SECRET="${R2_SECRET_ACCESS_KEY:-${R2_SECRET_ACCESS_KEY:-}}"
+    local R2_END="${R2_ENDPOINT:-${R2_ENDPOINT:-}}"
+    local R2_PATH="${R2_BUCKET_PATH:-${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}}"
+
+    if [ -z "$R2_KEY" ] || [ -z "$R2_SECRET" ] || [ -z "$R2_END" ]; then
         echo "R2 env vars not set — skipping R2 hydrate (stock behaviour)."
         return
     fi
@@ -110,56 +114,60 @@ hydrate_from_r2() {
     echo "  Hydrating content from Cloudflare R2"
     echo "============================================="
 
-    # Install rclone if the image doesn't already have it.
     if ! command -v rclone >/dev/null 2>&1; then
         echo "rclone not found — installing..."
         curl -fsSL https://rclone.org/install.sh | bash || {
-            echo "WARNING: rclone install failed; skipping R2 hydrate."
-            return
-        }
+            echo "WARNING: rclone install failed; skipping R2 hydrate."; return; }
     fi
 
-    # Define the rclone remote "manga-r2" entirely from env — no .conf file.
+    # Remote defined from env — provider MUST be "Other" for Cloudflare R2
+    # (rclone's "Cloudflare" provider value is rejected by this build).
     export RCLONE_CONFIG_MANGA_R2_TYPE="s3"
-    export RCLONE_CONFIG_MANGA_R2_PROVIDER="Cloudflare"
-    export RCLONE_CONFIG_MANGA_R2_ACCESS_KEY_ID="$RUNPOD_SECRET_R2_ACCESS_KEY_ID"
-    export RCLONE_CONFIG_MANGA_R2_SECRET_ACCESS_KEY="$RUNPOD_SECRET_R2_SECRET_ACCESS_KEY"
-    export RCLONE_CONFIG_MANGA_R2_ENDPOINT="$RUNPOD_SECRET_R2_ENDPOINT"
+    export RCLONE_CONFIG_MANGA_R2_PROVIDER="Other"
+    export RCLONE_CONFIG_MANGA_R2_ACCESS_KEY_ID="$R2_KEY"
+    export RCLONE_CONFIG_MANGA_R2_SECRET_ACCESS_KEY="$R2_SECRET"
+    export RCLONE_CONFIG_MANGA_R2_ENDPOINT="$R2_END"
+    export RCLONE_CONFIG_MANGA_R2_REGION="auto"
     export RCLONE_CONFIG_MANGA_R2_ACL="private"
-    # If your working .conf had a region line, uncomment:
-    # export RCLONE_CONFIG_MANGA_R2_REGION="auto"
 
-    # Bucket path holding your content. Adjust R2_BUCKET_PATH via env if needed.
-    local R2_BASE="manga-r2:${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}"
+    local R2_BASE="manga-r2:${R2_PATH}"
+    echo "R2 base: $R2_BASE"
 
-    # Only these user-owned subdirs are pulled. The image owns the core.
-    local SUBDIRS=("models" "custom_nodes" "user" "input")
+    if ! rclone lsd "$R2_BASE/" >/dev/null 2>&1; then
+        echo "WARNING: cannot list $R2_BASE — check keys/endpoint/path. Error:"
+        rclone lsd "$R2_BASE/" || true
+        return
+    fi
 
+    local RCLONE_FLAGS=(-P --transfers 16 --checkers 32 \
+        --multi-thread-streams 8 --multi-thread-cutoff 50M \
+        --s3-chunk-size 64M --s3-upload-concurrency 8 \
+        --fast-list --size-only \
+        --exclude "**/__pycache__/**" --exclude "*/.git/**")
+
+    # --- ComfyUI data dirs -> into the ComfyUI dir ---
+    local COMFY_DATA_DIRS=("models" "custom_nodes" "user" "input" "output")
     local d
-    for d in "${SUBDIRS[@]}"; do
-        # Skip subdirs that don't exist in R2 (rclone would just no-op, but this
-        # keeps the logs clean and avoids creating empty dirs unnecessarily).
-        echo "--> Syncing $d ..."
+    for d in "${COMFY_DATA_DIRS[@]}"; do
+        echo "--> [ComfyUI] $d"
         mkdir -p "$COMFYUI_DIR/$d"
-        # copy (not sync) so nothing already in the pod dir is deleted; the
-        # image may have placed baked custom_nodes here that must survive.
-        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" \
-            --transfers 16 --checkers 32 \
-            --multi-thread-streams 8 --multi-thread-cutoff 50M \
-            --s3-chunk-size 64M --s3-upload-concurrency 8 \
-            --fast-list --size-only \
-            --exclude "**/__pycache__/**" \
-            --exclude "custom_nodes/*/.git/**" \
+        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
+            || echo "WARNING: sync of $d failed (continuing)."
+    done
+
+    # --- Standalone tools / LoRA dirs -> siblings of ComfyUI ---
+    # Add new top-level bucket folders here as you create them.
+    local SIBLING_DIRS=("ai-toolkit" "musubi-tuner" "chica_prueba_2_lora" "hombre_prueba_2_lora")
+    local base_dir
+    base_dir="$(dirname "$COMFYUI_DIR")"   # /workspace/runpod-slim
+    for d in "${SIBLING_DIRS[@]}"; do
+        echo "--> [sibling] $d"
+        mkdir -p "$base_dir/$d"
+        rclone copy "$R2_BASE/$d/" "$base_dir/$d/" "${RCLONE_FLAGS[@]}" \
             || echo "WARNING: sync of $d failed (continuing)."
     done
 
     echo "R2 hydrate complete."
-
-    # Install requirements for any custom nodes pulled from R2. Their deps are
-    # NOT in the image's system site-packages (only the baked nodes are), so
-    # this step is what makes your own nodes work. Runs inside the venv, which
-    # is activated later — so we defer the actual pip work to run_node_requirements
-    # after the venv is active. Here we just flag that a hydrate happened.
     R2_HYDRATED=1
 }
 
