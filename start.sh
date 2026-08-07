@@ -130,7 +130,9 @@ hydrate_from_r2() {
     export RCLONE_CONFIG_MANGA_R2_REGION="auto"
     export RCLONE_CONFIG_MANGA_R2_ACL="private"
 
-    local R2_BASE="manga-r2:${R2_PATH}"
+    # strip any scheme from the endpoint for connection-string form
+    local EP="${R2_END#https://}"; EP="${EP#http://}"
+    local R2_BASE=":s3,provider=Other,access_key_id=${R2_KEY},secret_access_key=${R2_SECRET},endpoint=${EP}:${R2_PATH}"
     echo "R2 base: $R2_BASE"
 
     if ! rclone lsd "$R2_BASE/" >/dev/null 2>&1; then
