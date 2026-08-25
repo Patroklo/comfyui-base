@@ -159,7 +159,7 @@ hydrate_from_r2() {
 
     # --- Standalone tools / LoRA dirs -> siblings of ComfyUI ---
     # Add new top-level bucket folders here as you create them.
-    local SIBLING_DIRS=("ai-toolkit" "musubi-tuner" "chica_prueba_2_lora" "hombre_prueba_2_lora")
+    local SIBLING_DIRS=("ai-toolkit" "musubi-tuner" "chica_prueba_2_lora" "hombre_prueba_2_lora" "sd-scripts")
     local base_dir
     base_dir="$(dirname "$COMFYUI_DIR")"   # /workspace/runpod-slim
     for d in "${SIBLING_DIRS[@]}"; do
