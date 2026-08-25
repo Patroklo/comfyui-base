@@ -164,8 +164,8 @@ hydrate_from_r2() {
     base_dir="$(dirname "$COMFYUI_DIR")"   # /workspace/runpod-slim
     for d in "${SIBLING_DIRS[@]}"; do
         echo "--> [sibling] $d"
-        mkdir -p "$base_dir/$d"
-        rclone copy "$R2_BASE/$d/" "$base_dir/$d/" "${RCLONE_FLAGS[@]}" \
+        mkdir -p "$COMFYUI_DIR/$d"
+        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
             || echo "WARNING: sync of $d failed (continuing)."
     done
 
