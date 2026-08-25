@@ -173,7 +173,7 @@ hydrate_from_r2() {
     R2_HYDRATED=1
 }
 
-# Install requirements for user custom nodes pulled from R2 (venv must be active)
+# Install requirements for user custom nodes pulled from R2
 run_node_requirements() {
     [ "${R2_HYDRATED:-0}" = "1" ] || return
     echo "Installing requirements for R2-provided custom nodes..."
@@ -181,7 +181,6 @@ run_node_requirements() {
     for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
         [ -f "$req" ] || continue
         node=$(basename "$(dirname "$req")")
-        # Skip image-managed nodes; their deps are already in the image.
         case " ${BAKED_NODES[*]} " in
             *" $node "*) continue ;;
         esac
@@ -272,6 +271,58 @@ upgrade_comfyui_if_needed() {
     cp "$baked_manifest" "${installed_manifest}.tmp"
     mv "${installed_manifest}.tmp" "$installed_manifest"
     echo "ComfyUI workspace upgraded successfully"
+}
+
+# Install and start Cloudflare Tunnels for Web services
+setup_cloudflare_tunnels() {
+    echo "============================================="
+    echo "  Setting up Cloudflare Tunnels..."
+    echo "============================================="
+
+    # Install cloudflared if not present
+    if ! command -v cloudflared >/dev/null 2>&1; then
+        echo "cloudflared not found — installing..."
+        curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o /tmp/cloudflared.deb
+        dpkg -i /tmp/cloudflared.deb || apt-get install -f -y /tmp/cloudflared.deb || true
+        rm -f /tmp/cloudflared.deb
+    fi
+
+    # Helper function to launch quick tunnel and extract URL
+    launch_quick_tunnel() {
+        local name="$1"
+        local url="$2"
+        local logfile="/tmp/cf_${name}.log"
+
+        nohup cloudflared tunnel --url "$url" &> "$logfile" &
+        
+        local cf_url=""
+        for i in {1..12}; do
+            cf_url=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$logfile" 2>/dev/null | head -n 1 || true)
+            if [ -n "$cf_url" ]; then
+                break
+            fi
+            sleep 1
+        done
+
+        if [ -n "$cf_url" ]; then
+            echo "$cf_url"
+        else
+            echo "URL pending (check $logfile)"
+        fi
+    }
+
+    echo "Launching Quick Tunnels for services..."
+    COMFY_CF_URL=$(launch_quick_tunnel "comfyui" "http://localhost:8188")
+    FILEBROWSER_CF_URL=$(launch_quick_tunnel "filebrowser" "http://localhost:8080")
+    JUPYTER_CF_URL=$(launch_quick_tunnel "console" "http://localhost:8888")
+
+    echo "================================================================="
+    echo "                  CLOUDFLARE TUNNEL URLS                         "
+    echo "================================================================="
+    echo "  🎨 ComfyUI:         $COMFY_CF_URL"
+    echo "  📁 FileBrowser:     $FILEBROWSER_CF_URL"
+    echo "  💻 Console/Jupyter: $JUPYTER_CF_URL"
+    echo "================================================================="
 }
 
 # ---------------------------------------------------------------------------- #
@@ -404,6 +455,10 @@ echo "Starting ComfyUI with args: $FIXED_ARGS"
 python main.py $FIXED_ARGS &
 COMFY_PID=$!
 trap "kill $COMFY_PID 2>/dev/null" SIGTERM SIGINT
+
+# Setup Cloudflare Tunnels & log URLs
+setup_cloudflare_tunnels
+
 wait $COMFY_PID || true
 
 echo "============================================="
