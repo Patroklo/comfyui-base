@@ -12,7 +12,7 @@ PIP_CONSTRAINT_FILE="/opt/comfyui-runtime-constraints.txt"
 BAKED_NODES=("ComfyUI-Manager" "ComfyUI-KJNodes" "Civicomfy" "ComfyUI-RunpodDirect")
 
 # ---------------------------------------------------------------------------- #
-#                          Function Definitions                                #
+#                          Function Definitions                                  #
 # ---------------------------------------------------------------------------- #
 
 # Setup SSH with optional key or random password
@@ -61,8 +61,7 @@ export_env_vars() {
     > "$SSH_ENV_DIR"
     
     # Export to multiple locations for maximum compatibility
-    # Captures all PIP_* settings (e.g. PIP_PREFER_BINARY, PIP_ONLY_BINARY, PIP_CONSTRAINT)
-    printenv | grep -E '^RUNPOD_|^PATH=|^_=|^CUDA|^LD_LIBRARY_PATH|^PYTHONPATH|^PIP_' | while read -r line; do
+    printenv | grep -E '^RUNPOD_|^PATH=|^_=|^CUDA|^LD_LIBRARY_PATH|^PYTHONPATH|^PIP_CONSTRAINT=' | while read -r line; do
         # Get variable name and value
         name=$(echo "$line" | cut -d= -f1)
         value=$(echo "$line" | cut -d= -f2-)
@@ -90,7 +89,7 @@ export_env_vars() {
 }
 
 # ---------------------------------------------------------------------------- #
-#  Hydrate content from Cloudflare R2.                                         #
+#  Hydrate content from Cloudflare R2.                                          #
 #                                                                              #
 #  The bucket is a FULL ComfyUI checkout plus extra tools, so we DON'T pull    #
 #  "everything minus core" (root files like main.py would clobber the image's  #
@@ -186,7 +185,7 @@ run_node_requirements() {
             *" $node "*) continue ;;
         esac
         echo "  - $node"
-        pip install --prefer-binary -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+        pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     done
     echo "Custom-node requirements install complete."
 }
@@ -327,15 +326,8 @@ setup_cloudflare_tunnels() {
 }
 
 # ---------------------------------------------------------------------------- #
-#                               Main Program                                   #
+#                               Main Program                                     #
 # ---------------------------------------------------------------------------- #
-
-# Configure pip to prioritize pre-compiled binary wheels over compiling from source
-export PIP_PREFER_BINARY=1
-
-# Note: If you want pip to strictly FAIL instead of compiling if a binary wheel
-# is missing, uncomment the line below:
-# export PIP_ONLY_BINARY=":all:"
 
 # Setup environment
 if [ -f "$PIP_CONSTRAINT_FILE" ]; then
@@ -399,12 +391,12 @@ if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
             esac
             CURRENT=$((CURRENT + 1))
             echo "[$CURRENT] $NODE_NAME"
-            pip install --prefer-binary -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+            pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
             INSTALLED=$((INSTALLED + 1))
         fi
     done
     echo "Ensuring ComfyUI requirements are present..."
-    pip install --prefer-binary -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     echo "Migration complete — $INSTALLED user nodes processed (${NODE_COUNT} total, baked nodes skipped)"
     echo "Old venv backed up at ${OLD_VENV_DIR}.bak — delete it to free space:"
     echo "  rm -rf ${OLD_VENV_DIR}.bak"
