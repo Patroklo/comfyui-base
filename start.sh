@@ -61,7 +61,7 @@ export_env_vars() {
     > "$SSH_ENV_DIR"
     
     # Export to multiple locations for maximum compatibility
-    printenv | grep -E '^RUNPOD_|^PATH=|^_=|^CUDA|^LD_LIBRARY_PATH|^PYTHONPATH|^PIP_CONSTRAINT=' | while read -r line; do
+    printenv | grep -E '^RUNPOD_|^R2_|^PATH=|^_=|^CUDA|^LD_LIBRARY_PATH|^PYTHONPATH|^PIP_CONSTRAINT=' | while read -r line; do
         # Get variable name and value
         name=$(echo "$line" | cut -d= -f1)
         value=$(echo "$line" | cut -d= -f2-)
@@ -115,9 +115,13 @@ hydrate_from_r2() {
     echo "============================================="
 
     if ! command -v rclone >/dev/null 2>&1; then
-        echo "rclone not found — installing..."
-        curl -fsSL https://rclone.org/install.sh | bash || {
-            echo "WARNING: rclone install failed; skipping R2 hydrate."; return; }
+        echo "rclone not found — installing via .deb..."
+        curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
+        dpkg -i /tmp/rclone.deb || (apt-get update && apt-get install -f -y /tmp/rclone.deb) || {
+            echo "WARNING: rclone install failed; skipping R2 hydrate."
+            return 0
+        }
+        rm -f /tmp/rclone.deb
     fi
 
     # Remote defined from env — provider MUST be "Other" for Cloudflare R2
