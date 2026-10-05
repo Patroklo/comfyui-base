@@ -10,8 +10,11 @@ FILEBROWSER_CONFIG="/root/.config/filebrowser/config.json"
 DB_FILE="/workspace/runpod-slim/filebrowser.db"
 PIP_CONSTRAINT_FILE="/opt/comfyui-runtime-constraints.txt"
 BAKED_NODES=("ComfyUI-Manager" "ComfyUI-KJNodes" "Civicomfy" "ComfyUI-RunpodDirect")
-R2_VENV_ARCHIVE="archive_name.tar"             # path of the tar inside the R2 bucket (relative to R2_BUCKET_PATH)
-VENV_ARCHIVE="$COMFYUI_DIR/archive_name.tar"   # adjust if the tar lives elsewhere
+WORKSPACE_DIR="$(dirname "$COMFYUI_DIR")"
+# Full ComfyUI install (core + custom nodes + .venv-cu128) packed as a plain .tar
+# with a single top-level "ComfyUI/" folder. Path is relative to R2_BUCKET_PATH.
+R2_ARCHIVE="${R2_ARCHIVE:-comfyui.tar}"
+INSTALL_MARKER="$COMFYUI_DIR/.r2-installed"
 
 # ---------------------------------------------------------------------------- #
 #                          Function Definitions                                  #
@@ -91,115 +94,138 @@ export_env_vars() {
 }
 
 # ---------------------------------------------------------------------------- #
-#  Hydrate content from Cloudflare R2.                                          #
+#  Install ComfyUI from a single archive stored in Cloudflare R2.               #
 #                                                                              #
-#  The bucket is a FULL ComfyUI checkout plus extra tools, so we DON'T pull    #
-#  "everything minus core" (root files like main.py would clobber the image's  #
-#  ComfyUI). Instead we pull two explicit lists:                               #
-#    - COMFY_DATA_DIRS  -> into the ComfyUI dir (models, custom_nodes, ...)     #
-#    - SIBLING_DIRS     -> into /workspace/runpod-slim (standalone tools/LoRAs) #
-#  Add new folders to SIBLING_DIRS as you create them in the bucket.           #
+#  The archive (R2_ARCHIVE, an uncompressed .tar with one top-level "ComfyUI/" folder      #
+#  that includes .venv-cu128) is downloaded and extracted into the workspace.   #
+#  It is extracted to a temp dir and moved into place, so an interrupted        #
+#  download never leaves a half-installed ComfyUI. Returns non-zero on failure. #
 # ---------------------------------------------------------------------------- #
-hydrate_from_r2() {
-    # Accept bare or -prefixed names.
-    local R2_KEY="${R2_ACCESS_KEY_ID:-${R2_ACCESS_KEY_ID:-}}"
-    local R2_SECRET="${R2_SECRET_ACCESS_KEY:-${R2_SECRET_ACCESS_KEY:-}}"
-    local R2_END="${R2_ENDPOINT:-${R2_ENDPOINT:-}}"
-    local R2_PATH="${R2_BUCKET_PATH:-${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}}"
-
-    if [ -z "$R2_KEY" ] || [ -z "$R2_SECRET" ] || [ -z "$R2_END" ]; then
-        echo "R2 env vars not set — skipping R2 hydrate (stock behaviour)."
-        return
+# Configure rclone for R2 (creds via env vars so they never show in logs/`ps`)
+# and set R2_BASE to the bucket path. Returns non-zero if R2 isn't usable.
+r2_setup() {
+    if [ -z "${R2_ACCESS_KEY_ID:-}" ] || [ -z "${R2_SECRET_ACCESS_KEY:-}" ] || [ -z "${R2_ENDPOINT:-}" ]; then
+        echo "R2 env vars not set."
+        return 1
     fi
-
-    echo "============================================="
-    echo "  Hydrating content from Cloudflare R2"
-    echo "============================================="
-
     if ! command -v rclone >/dev/null 2>&1; then
         echo "rclone not found — installing..."
         curl -fsSL https://rclone.org/install.sh | bash || {
-            echo "WARNING: rclone install failed; skipping R2 hydrate."; return; }
+            echo "WARNING: rclone install failed."; return 1; }
     fi
-
-    # Remote defined from env — provider MUST be "Other" for Cloudflare R2
-    # (rclone's "Cloudflare" provider value is rejected by this build).
-    export RCLONE_CONFIG_MANGA_R2_TYPE="s3"
-    export RCLONE_CONFIG_MANGA_R2_PROVIDER="Other"
-    export RCLONE_CONFIG_MANGA_R2_ACCESS_KEY_ID="$R2_KEY"
-    export RCLONE_CONFIG_MANGA_R2_SECRET_ACCESS_KEY="$R2_SECRET"
-    export RCLONE_CONFIG_MANGA_R2_ENDPOINT="$R2_END"
-    export RCLONE_CONFIG_MANGA_R2_REGION="auto"
-    export RCLONE_CONFIG_MANGA_R2_ACL="private"
-
     # strip any scheme from the endpoint for connection-string form
-    local EP="${R2_END#https://}"; EP="${EP#http://}"
-    local R2_BASE=":s3,provider=Other,access_key_id=${R2_KEY},secret_access_key=${R2_SECRET},endpoint=${EP}:${R2_PATH}"
-    echo "R2 base: $R2_BASE"
-
-    if ! rclone lsd "$R2_BASE/" >/dev/null 2>&1; then
-        echo "WARNING: cannot list $R2_BASE — check keys/endpoint/path. Error:"
-        rclone lsd "$R2_BASE/" || true
-        return
-    fi
-
-    local RCLONE_FLAGS=(-P --transfers 16 --checkers 32 \
-        --multi-thread-streams 8 --multi-thread-cutoff 50M \
-        --s3-chunk-size 64M --s3-upload-concurrency 8 \
-        --fast-list --size-only \
-        --exclude "**/__pycache__/**" --exclude "*/.git/**")
-
-    # --- ComfyUI data dirs -> into the ComfyUI dir ---
-    local COMFY_DATA_DIRS=("models" "custom_nodes" "user" "input" "output")
-    local d
-    for d in "${COMFY_DATA_DIRS[@]}"; do
-        echo "--> [ComfyUI] $d"
-        mkdir -p "$COMFYUI_DIR/$d"
-        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
-            || echo "WARNING: sync of $d failed (continuing)."
-    done
-
-    # --- Standalone tools / LoRA dirs -> siblings of ComfyUI ---
-    # Add new top-level bucket folders here as you create them.
-    local SIBLING_DIRS=("ai-toolkit" "musubi-tuner" "chica_prueba_2_lora" "hombre_prueba_2_lora" "sd-scripts")
-    local base_dir
-    base_dir="$(dirname "$COMFYUI_DIR")"   # /workspace/runpod-slim
-    for d in "${SIBLING_DIRS[@]}"; do
-        echo "--> [sibling] $d"
-        mkdir -p "$COMFYUI_DIR/$d"
-        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
-            || echo "WARNING: sync of $d failed (continuing)."
-    done
-    echo "--> [venv] downloading $R2_VENV_ARCHIVE"
-
-    # --- Venv archive: only download if the venv is missing and the tar isn't already here ---
-    echo "--> [venv] downloading $R2_VENV_ARCHIVE"
-    # No --exclude here: rclone refuses filters on single-file copies
-    rclone copyto "$R2_BASE/$R2_VENV_ARCHIVE" "$VENV_ARCHIVE" \
-        -P --multi-thread-streams 8 --multi-thread-cutoff 50M \
-        --s3-chunk-size 64M --s3-upload-concurrency 8 \
-        || echo "WARNING: download of $R2_VENV_ARCHIVE failed."
-        
-    echo "R2 hydrate complete."
-
-    R2_HYDRATED=1
+    local EP="${R2_ENDPOINT#https://}"; EP="${EP#http://}"
+    export RCLONE_S3_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+    export RCLONE_S3_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+    R2_BASE=":s3,provider=Other,region=auto,endpoint=${EP}:${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}"
 }
 
-# Install requirements for user custom nodes pulled from R2
-run_node_requirements() {
-    [ "${R2_HYDRATED:-0}" = "1" ] || return
-    echo "Installing requirements for R2-provided custom nodes..."
-    local req node
-    for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
-        [ -f "$req" ] || continue
-        node=$(basename "$(dirname "$req")")
-        case " ${BAKED_NODES[*]} " in
-            *" $node "*) continue ;;
-        esac
-        echo "  - $node"
-        pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
-    done
-    echo "Custom-node requirements install complete."
+install_comfyui_from_r2() {
+    echo "============================================="
+    echo "  Installing ComfyUI from Cloudflare R2"
+    echo "============================================="
+
+    r2_setup || return 1
+
+    local TMP_DIR="$WORKSPACE_DIR/.r2-install"
+    rm -rf "$TMP_DIR"
+    mkdir -p "$TMP_DIR/extract"
+
+    echo "--> Downloading $R2_ARCHIVE"
+    rclone copyto "$R2_BASE/$R2_ARCHIVE" "$TMP_DIR/archive.tar" \
+        -P --multi-thread-streams 8 --multi-thread-cutoff 50M \
+        --s3-chunk-size 64M --s3-upload-concurrency 8 || {
+        echo "WARNING: download of $R2_ARCHIVE failed."; rm -rf "$TMP_DIR"; return 1; }
+
+    echo "--> Extracting"
+    tar -xf "$TMP_DIR/archive.tar" -C "$TMP_DIR/extract" || {
+        echo "WARNING: extraction failed."; rm -rf "$TMP_DIR"; return 1; }
+    if [ ! -f "$TMP_DIR/extract/ComfyUI/main.py" ] || [ ! -d "$TMP_DIR/extract/ComfyUI/.venv-cu128" ]; then
+        echo "WARNING: archive must contain ComfyUI/main.py and ComfyUI/.venv-cu128."
+        rm -rf "$TMP_DIR"; return 1
+    fi
+
+    # Never delete user data: move any existing dir aside before installing.
+    [ -e "$COMFYUI_DIR" ] && mv "$COMFYUI_DIR" "${COMFYUI_DIR}.pre-r2.$(date +%s)"
+    mv "$TMP_DIR/extract/ComfyUI" "$COMFYUI_DIR"
+    touch "$INSTALL_MARKER"
+    rm -rf "$TMP_DIR"
+    echo "ComfyUI installed from R2."
+}
+
+# Pack the ComfyUI dir and replace the archive in R2. Safe to call any time:
+#  - only runs for an R2-installed workspace (never overwrites the good archive
+#    with a baked-fallback install)
+#  - one run at a time (flock)
+#  - uploads to a temp name then renames, so a failed upload keeps the old archive
+# Optional env: R2_BACKUP_EXCLUDE="ComfyUI/models ComfyUI/output" (paths relative
+# to /workspace/runpod-slim, space separated).
+backup_comfyui_to_r2() {
+    if [ ! -f "$INSTALL_MARKER" ]; then
+        echo "[backup] No R2 install marker — skipping (nothing to back up safely)."
+        return 0
+    fi
+    mkdir -p "$WORKSPACE_DIR/.r2-backup"
+    (
+        flock -w "${1:-0}" 9 || { echo "[backup] another backup is running — skipping."; exit 0; }
+        r2_setup || exit 1
+        local tmp="$WORKSPACE_DIR/.r2-backup/archive.tar"
+        local excludes=(--exclude='__pycache__')
+        local e
+        for e in ${R2_BACKUP_EXCLUDE:-}; do excludes+=(--exclude="$e"); done
+
+        echo "[backup] $(date -u +%H:%M:%S) packing $COMFYUI_DIR"
+        tar -cf "$tmp" "${excludes[@]}" -C "$WORKSPACE_DIR" "$(basename "$COMFYUI_DIR")" \
+            || { echo "[backup] tar failed"; rm -f "$tmp"; exit 1; }
+
+        echo "[backup] uploading $(du -h "$tmp" | cut -f1)"
+        rclone copyto "$tmp" "$R2_BASE/$R2_ARCHIVE.uploading" \
+            --s3-no-check-bucket --s3-disable-checksum \
+            --multi-thread-streams 8 --s3-chunk-size 128M --s3-upload-concurrency 8 \
+            && rclone moveto "$R2_BASE/$R2_ARCHIVE.uploading" "$R2_BASE/$R2_ARCHIVE" \
+            || { echo "[backup] upload failed — previous archive kept"; rm -f "$tmp"; exit 1; }
+
+        rm -f "$tmp"
+        echo "[backup] $(date -u +%H:%M:%S) done"
+    ) 9>"$WORKSPACE_DIR/.r2-backup/lock"
+}
+
+# Background loop: back up every BACKUP_INTERVAL_MIN minutes (default 30, 0 = off).
+start_backup_timer() {
+    local minutes="${BACKUP_INTERVAL_MIN:-30}"
+    [ "$minutes" -gt 0 ] 2>/dev/null || { echo "Periodic backup disabled."; return; }
+    [ -f "$INSTALL_MARKER" ] || { echo "Periodic backup off (not an R2 install)."; return; }
+    (
+        while true; do
+            sleep $((minutes * 60))
+            backup_comfyui_to_r2 0 || true
+        done
+    ) &
+    BACKUP_LOOP_PID=$!
+    echo "Periodic R2 backup every ${minutes} min (pid $BACKUP_LOOP_PID)."
+}
+
+# SIGTERM/SIGINT handler: stop ComfyUI (consistent files), stop the timer, then
+# a best-effort final backup. The platform may SIGKILL us before it finishes.
+shutdown_handler() {
+    echo "Shutdown signal received."
+    kill "$COMFY_PID" 2>/dev/null || true
+    wait "$COMFY_PID" 2>/dev/null || true
+    if [ -n "${BACKUP_LOOP_PID:-}" ]; then
+        pkill -P "$BACKUP_LOOP_PID" 2>/dev/null || true
+        kill "$BACKUP_LOOP_PID" 2>/dev/null || true
+    fi
+    backup_comfyui_to_r2 5 || true
+    exit 0
+}
+
+# Fallback: install the ComfyUI bundle baked into the image.
+install_comfyui_from_baked() {
+    echo "Installing ComfyUI from the baked image bundle..."
+    [ -e "$COMFYUI_DIR" ] && mv "$COMFYUI_DIR" "${COMFYUI_DIR}.pre-baked.$(date +%s)"
+    cp -r "$BAKED_COMFYUI_DIR" "$COMFYUI_DIR"
+    python3.12 -m venv --system-site-packages "$VENV_DIR"
+    "$VENV_DIR/bin/python" -m ensurepip
 }
 
 # Start Jupyter Lab server for remote access
@@ -341,6 +367,15 @@ setup_cloudflare_tunnels() {
 #                               Main Program                                     #
 # ---------------------------------------------------------------------------- #
 
+# `comfyui-backup` runs `/start.sh --backup`. SSH/Jupyter shells don't inherit the
+# R2_* vars, so they are saved to a root-only file at boot and loaded here.
+R2_ENV_FILE="/root/.r2-env"
+if [ "${1:-}" = "--backup" ]; then
+    [ -f "$R2_ENV_FILE" ] && source "$R2_ENV_FILE"
+    backup_comfyui_to_r2 600
+    exit $?
+fi
+
 # Setup environment
 if [ -f "$PIP_CONSTRAINT_FILE" ]; then
     export PIP_CONSTRAINT="$PIP_CONSTRAINT_FILE"
@@ -349,6 +384,14 @@ fi
 
 setup_ssh
 export_env_vars
+
+# Persist backup settings for the `comfyui-backup` command (root-only file).
+( umask 077
+  for v in R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_ENDPOINT R2_BUCKET_PATH R2_ARCHIVE R2_BACKUP_EXCLUDE; do
+      [ -n "${!v:-}" ] && printf 'export %s=%q\n' "$v" "${!v}"
+  done > "$R2_ENV_FILE" ) || true
+printf '#!/bin/bash\nexec /start.sh --backup\n' > /usr/local/bin/comfyui-backup
+chmod +x /usr/local/bin/comfyui-backup
 
 # Initialize FileBrowser if not already done
 if [ ! -f "$DB_FILE" ]; then
@@ -376,57 +419,56 @@ if [ ! -f "$ARGS_FILE" ]; then
     echo "Created empty ComfyUI arguments file at $ARGS_FILE"
 fi
 
-upgrade_comfyui_if_needed
+# Three cases:
+#   1. R2 install marker present     -> already installed from the archive, use it.
+#   2. Existing non-R2 install       -> legacy pod: stock in-place upgrade/migration.
+#   3. Fresh workspace               -> install from the R2 archive, falling back
+#                                       to the bundle baked into the image.
+if [ -f "$INSTALL_MARKER" ]; then
+    echo "Using existing ComfyUI installation (installed from R2)"
+elif [ -f "$COMFYUI_DIR/main.py" ]; then
+    upgrade_comfyui_if_needed
 
-# Migrate old CUDA 12.4 venv to cu128
-if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
-    NODE_COUNT=$(find "$COMFYUI_DIR/custom_nodes" -maxdepth 2 -name "requirements.txt" 2>/dev/null | wc -l)
-    echo "============================================="
-    echo "  CUDA 12.4 -> 12.8 migration"
-    echo "  Reinstalling deps for $NODE_COUNT custom nodes"
-    echo "  This may take several minutes"
-    echo "============================================="
-    mv "$OLD_VENV_DIR" "${OLD_VENV_DIR}.bak"
-    cd "$COMFYUI_DIR"
-    python3.12 -m venv --system-site-packages "$VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-    python -m ensurepip
-    # Skip nodes baked into the image — their deps are in system site-packages
-    BAKED_NODES_STR="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
-    CURRENT=0
-    INSTALLED=0
-    for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
-        if [ -f "$req" ]; then
-            NODE_NAME=$(basename "$(dirname "$req")")
-            case " $BAKED_NODES_STR " in
-                *" $NODE_NAME "*) continue ;;
-            esac
-            CURRENT=$((CURRENT + 1))
-            echo "[$CURRENT] $NODE_NAME"
-            pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
-            INSTALLED=$((INSTALLED + 1))
-        fi
-    done
-    echo "Ensuring ComfyUI requirements are present..."
-    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
-    echo "Migration complete — $INSTALLED user nodes processed (${NODE_COUNT} total, baked nodes skipped)"
-    echo "Old venv backed up at ${OLD_VENV_DIR}.bak — delete it to free space:"
-    echo "  rm -rf ${OLD_VENV_DIR}.bak"
+    # Migrate old CUDA 12.4 venv to cu128
+    if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
+        NODE_COUNT=$(find "$COMFYUI_DIR/custom_nodes" -maxdepth 2 -name "requirements.txt" 2>/dev/null | wc -l)
+        echo "============================================="
+        echo "  CUDA 12.4 -> 12.8 migration"
+        echo "  Reinstalling deps for $NODE_COUNT custom nodes"
+        echo "  This may take several minutes"
+        echo "============================================="
+        mv "$OLD_VENV_DIR" "${OLD_VENV_DIR}.bak"
+        cd "$COMFYUI_DIR"
+        python3.12 -m venv --system-site-packages "$VENV_DIR"
+        source "$VENV_DIR/bin/activate"
+        python -m ensurepip
+        # Skip nodes baked into the image — their deps are in system site-packages
+        BAKED_NODES_STR="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
+        CURRENT=0
+        INSTALLED=0
+        for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
+            if [ -f "$req" ]; then
+                NODE_NAME=$(basename "$(dirname "$req")")
+                case " $BAKED_NODES_STR " in
+                    *" $NODE_NAME "*) continue ;;
+                esac
+                CURRENT=$((CURRENT + 1))
+                echo "[$CURRENT] $NODE_NAME"
+                pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+                INSTALLED=$((INSTALLED + 1))
+            fi
+        done
+        echo "Ensuring ComfyUI requirements are present..."
+        pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+        echo "Migration complete — $INSTALLED user nodes processed (${NODE_COUNT} total, baked nodes skipped)"
+        echo "Old venv backed up at ${OLD_VENV_DIR}.bak — delete it to free space:"
+        echo "  rm -rf ${OLD_VENV_DIR}.bak"
+    fi
+else
+    install_comfyui_from_r2 || install_comfyui_from_baked
 fi
 
-# Setup ComfyUI if needed
-# Just activate the existing venv
-tar -xf "$VENV_ARCHIVE" -C "$COMFYUI_DIR"
 source "$VENV_DIR/bin/activate"
-echo "Using existing ComfyUI installation"
-
-# ---- R2 hydrate: pull user content, then install its custom-node deps -------
-# Placed AFTER ComfyUI setup (so the dirs exist and the venv is active) and
-# BEFORE the ComfyUI launch (which blocks on `wait`). The venv is active at
-# this point via one of the branches above.
-hydrate_from_r2
-# run_node_requirements
-# -----------------------------------------------------------------------------
 
 # Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
 python -m pip --version > /dev/null 2>&1
@@ -444,7 +486,8 @@ fi
 echo "Starting ComfyUI with args: $FIXED_ARGS"
 python main.py $FIXED_ARGS &
 COMFY_PID=$!
-trap "kill $COMFY_PID 2>/dev/null" SIGTERM SIGINT
+trap shutdown_handler SIGTERM SIGINT
+start_backup_timer
 
 # Setup Cloudflare Tunnels & log URLs
 setup_cloudflare_tunnels
@@ -459,4 +502,6 @@ echo "    cd $COMFYUI_DIR && source .venv-cu128/bin/activate"
 echo "    python main.py $FIXED_ARGS"
 echo "============================================="
 
-sleep infinity
+# `wait` (unlike a foreground sleep) lets the shutdown trap fire immediately
+sleep infinity &
+wait $!
