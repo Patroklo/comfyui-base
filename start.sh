@@ -10,6 +10,8 @@ FILEBROWSER_CONFIG="/root/.config/filebrowser/config.json"
 DB_FILE="/workspace/runpod-slim/filebrowser.db"
 PIP_CONSTRAINT_FILE="/opt/comfyui-runtime-constraints.txt"
 BAKED_NODES=("ComfyUI-Manager" "ComfyUI-KJNodes" "Civicomfy" "ComfyUI-RunpodDirect")
+R2_VENV_ARCHIVE="archive_name.tar"             # path of the tar inside the R2 bucket (relative to R2_BUCKET_PATH)
+VENV_ARCHIVE="$COMFYUI_DIR/archive_name.tar"   # adjust if the tar lives elsewhere
 
 # ---------------------------------------------------------------------------- #
 #                          Function Definitions                                  #
