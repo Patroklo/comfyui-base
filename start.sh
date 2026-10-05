@@ -172,9 +172,14 @@ hydrate_from_r2() {
     done
     echo "--> [venv] downloading $R2_VENV_ARCHIVE"
 
-    rclone copyto "$R2_BASE/$R2_VENV_ARCHIVE" "$VENV_ARCHIVE" "${RCLONE_FLAGS[@]}" \
-            || echo "WARNING: download of $R2_VENV_ARCHIVE failed."
-
+    # --- Venv archive: only download if the venv is missing and the tar isn't already here ---
+    echo "--> [venv] downloading $R2_VENV_ARCHIVE"
+    # No --exclude here: rclone refuses filters on single-file copies
+    rclone copyto "$R2_BASE/$R2_VENV_ARCHIVE" "$VENV_ARCHIVE" \
+        -P --multi-thread-streams 8 --multi-thread-cutoff 50M \
+        --s3-chunk-size 64M --s3-upload-concurrency 8 \
+        || echo "WARNING: download of $R2_VENV_ARCHIVE failed."
+        
     echo "R2 hydrate complete."
 
     R2_HYDRATED=1
