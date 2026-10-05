@@ -3,14 +3,12 @@ set -e  # Exit the script if any statement returns a non-true return value
 
 COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
 BAKED_COMFYUI_DIR="/opt/comfyui-baked"
-BUNDLE_VERSION_FILE=".runpod-bundle-version"
 VENV_DIR="$COMFYUI_DIR/.venv-cu128"
-OLD_VENV_DIR="$COMFYUI_DIR/.venv"
 FILEBROWSER_CONFIG="/root/.config/filebrowser/config.json"
 DB_FILE="/workspace/runpod-slim/filebrowser.db"
 PIP_CONSTRAINT_FILE="/opt/comfyui-runtime-constraints.txt"
-BAKED_NODES=("ComfyUI-Manager" "ComfyUI-KJNodes" "Civicomfy" "ComfyUI-RunpodDirect")
 WORKSPACE_DIR="$(dirname "$COMFYUI_DIR")"
+TUNNEL_URLS_FILE="$WORKSPACE_DIR/cloudflare_tunnel_urls.txt"
 # Full ComfyUI install (core + custom nodes + .venv-cu128) packed as a plain .tar
 # with a single top-level "ComfyUI/" folder. Path is relative to R2_BUCKET_PATH.
 R2_ARCHIVE="${R2_ARCHIVE:-comfyui.tar}"
@@ -205,8 +203,7 @@ start_backup_timer() {
     echo "Periodic R2 backup every ${minutes} min (pid $BACKUP_LOOP_PID)."
 }
 
-# SIGTERM/SIGINT handler: stop ComfyUI (consistent files), stop the timer, then
-# a best-effort final backup. The platform may SIGKILL us before it finishes.
+# SIGTERM/SIGINT handler: stop ComfyUI (consistent files) and stop the timer.
 shutdown_handler() {
     echo "Shutdown signal received."
     kill "$COMFY_PID" 2>/dev/null || true
@@ -215,7 +212,6 @@ shutdown_handler() {
         pkill -P "$BACKUP_LOOP_PID" 2>/dev/null || true
         kill "$BACKUP_LOOP_PID" 2>/dev/null || true
     fi
-    backup_comfyui_to_r2 5 || true
     exit 0
 }
 
@@ -244,71 +240,6 @@ start_jupyter() {
         --IdentityProvider.token="${JUPYTER_PASSWORD:-}" \
         --ServerApp.allow_origin=* &> /jupyter.log &
     echo "Jupyter Lab started"
-}
-
-# Upgrade the image-managed ComfyUI files while leaving user data on the
-# persistent workspace untouched.
-upgrade_comfyui_if_needed() {
-    local baked_manifest="$BAKED_COMFYUI_DIR/$BUNDLE_VERSION_FILE"
-    local installed_manifest="$COMFYUI_DIR/$BUNDLE_VERSION_FILE"
-
-    # A missing workspace is handled by the first-time setup below.
-    if [ ! -d "$COMFYUI_DIR" ]; then
-        return
-    fi
-
-    if [ ! -f "$baked_manifest" ]; then
-        echo "WARNING: Baked ComfyUI bundle manifest is missing; skipping upgrade"
-        return
-    fi
-
-    if [ -f "$installed_manifest" ] && cmp -s "$baked_manifest" "$installed_manifest"; then
-        echo "Using existing ComfyUI installation (bundle is current)"
-        return
-    fi
-
-    echo "============================================="
-    echo "  Upgrading ComfyUI workspace from baked bundle"
-    echo "  Preserving models, user data, and custom nodes"
-    echo "============================================="
-
-    # Sync ComfyUI core and remove files that no longer exist in the new
-    # release. Excluded paths belong to the user or are managed separately.
-    rsync -a --delete \
-        --exclude="/$BUNDLE_VERSION_FILE" \
-        --exclude="/.venv*" \
-        --exclude="/models" \
-        --exclude="/input" \
-        --exclude="/output" \
-        --exclude="/user" \
-        --exclude="/custom_nodes" \
-        --exclude="/extra_model_paths.yaml" \
-        "$BAKED_COMFYUI_DIR/" "$COMFYUI_DIR/"
-
-    mkdir -p "$COMFYUI_DIR/custom_nodes"
-
-    # Update files located directly under custom_nodes without deleting
-    # user-provided files or directories.
-    rsync -a --exclude="*/" \
-        "$BAKED_COMFYUI_DIR/custom_nodes/" "$COMFYUI_DIR/custom_nodes/"
-
-    # Image-managed nodes are pinned with the image and must be upgraded.
-    # Other custom-node directories are user-owned and remain untouched.
-    local node
-    for node in "${BAKED_NODES[@]}"; do
-        if [ -d "$BAKED_COMFYUI_DIR/custom_nodes/$node" ]; then
-            mkdir -p "$COMFYUI_DIR/custom_nodes/$node"
-            rsync -a --delete \
-                "$BAKED_COMFYUI_DIR/custom_nodes/$node/" \
-                "$COMFYUI_DIR/custom_nodes/$node/"
-        fi
-    done
-
-    # Write the manifest only after every sync succeeds. An interrupted
-    # migration is retried on the next container start.
-    cp "$baked_manifest" "${installed_manifest}.tmp"
-    mv "${installed_manifest}.tmp" "$installed_manifest"
-    echo "ComfyUI workspace upgraded successfully"
 }
 
 # Install and start Cloudflare Tunnels for Web services
@@ -361,6 +292,15 @@ setup_cloudflare_tunnels() {
     echo "  📁 FileBrowser:     $FILEBROWSER_CF_URL"
     echo "  💻 Console/Jupyter: $JUPYTER_CF_URL"
     echo "================================================================="
+
+    # Always rewrite the URLs file from scratch so it never shows stale links.
+    rm -f "$TUNNEL_URLS_FILE"
+    {
+        echo "ComfyUI:         $COMFY_CF_URL"
+        echo "FileBrowser:     $FILEBROWSER_CF_URL"
+        echo "Console/Jupyter: $JUPYTER_CF_URL"
+    } > "$TUNNEL_URLS_FILE"
+    echo "Tunnel URLs written to $TUNNEL_URLS_FILE"
 }
 
 # ---------------------------------------------------------------------------- #
@@ -419,51 +359,12 @@ if [ ! -f "$ARGS_FILE" ]; then
     echo "Created empty ComfyUI arguments file at $ARGS_FILE"
 fi
 
-# Three cases:
-#   1. R2 install marker present     -> already installed from the archive, use it.
-#   2. Existing non-R2 install       -> legacy pod: stock in-place upgrade/migration.
-#   3. Fresh workspace               -> install from the R2 archive, falling back
-#                                       to the bundle baked into the image.
+# Two cases:
+#   1. R2 install marker present -> already installed from the archive, use it.
+#   2. Fresh workspace           -> install from the R2 archive, falling back
+#                                   to the bundle baked into the image.
 if [ -f "$INSTALL_MARKER" ]; then
     echo "Using existing ComfyUI installation (installed from R2)"
-elif [ -f "$COMFYUI_DIR/main.py" ]; then
-    upgrade_comfyui_if_needed
-
-    # Migrate old CUDA 12.4 venv to cu128
-    if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
-        NODE_COUNT=$(find "$COMFYUI_DIR/custom_nodes" -maxdepth 2 -name "requirements.txt" 2>/dev/null | wc -l)
-        echo "============================================="
-        echo "  CUDA 12.4 -> 12.8 migration"
-        echo "  Reinstalling deps for $NODE_COUNT custom nodes"
-        echo "  This may take several minutes"
-        echo "============================================="
-        mv "$OLD_VENV_DIR" "${OLD_VENV_DIR}.bak"
-        cd "$COMFYUI_DIR"
-        python3.12 -m venv --system-site-packages "$VENV_DIR"
-        source "$VENV_DIR/bin/activate"
-        python -m ensurepip
-        # Skip nodes baked into the image — their deps are in system site-packages
-        BAKED_NODES_STR="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
-        CURRENT=0
-        INSTALLED=0
-        for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
-            if [ -f "$req" ]; then
-                NODE_NAME=$(basename "$(dirname "$req")")
-                case " $BAKED_NODES_STR " in
-                    *" $NODE_NAME "*) continue ;;
-                esac
-                CURRENT=$((CURRENT + 1))
-                echo "[$CURRENT] $NODE_NAME"
-                pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
-                INSTALLED=$((INSTALLED + 1))
-            fi
-        done
-        echo "Ensuring ComfyUI requirements are present..."
-        pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
-        echo "Migration complete — $INSTALLED user nodes processed (${NODE_COUNT} total, baked nodes skipped)"
-        echo "Old venv backed up at ${OLD_VENV_DIR}.bak — delete it to free space:"
-        echo "  rm -rf ${OLD_VENV_DIR}.bak"
-    fi
 else
     install_comfyui_from_r2 || install_comfyui_from_baked
 fi
