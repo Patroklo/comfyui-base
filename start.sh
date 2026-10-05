@@ -415,32 +415,10 @@ if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
 fi
 
 # Setup ComfyUI if needed
-if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
-    echo "First time setup: Copying baked ComfyUI to workspace..."
-
-    # Copy baked ComfyUI from image (no git, no network)
-    if [ ! -d "$COMFYUI_DIR" ]; then
-        cp -r /opt/comfyui-baked "$COMFYUI_DIR"
-        echo "ComfyUI copied to workspace"
-    fi
-
-    # Create venv with access to system packages (torch, numpy, etc. pre-installed in image)
-    if [ ! -d "$VENV_DIR" ]; then
-        cd "$COMFYUI_DIR"
-        python3.12 -m venv --system-site-packages "$VENV_DIR"
-        source "$VENV_DIR/bin/activate"
-
-        # Ensure pip is available in the venv (needed for ComfyUI-Manager)
-        python -m ensurepip
-
-        echo "Base packages (torch, numpy, etc.) available from system site-packages"
-        echo "ComfyUI ready — all dependencies pre-installed in image"
-    fi
-else
-    # Just activate the existing venv
-    source "$VENV_DIR/bin/activate"
-    echo "Using existing ComfyUI installation"
-fi
+# Just activate the existing venv
+tar -xf "$VENV_ARCHIVE" -C "$COMFYUI_DIR"
+source "$VENV_DIR/bin/activate"
+echo "Using existing ComfyUI installation"
 
 # ---- R2 hydrate: pull user content, then install its custom-node deps -------
 # Placed AFTER ComfyUI setup (so the dirs exist and the venv is active) and
