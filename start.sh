@@ -7,6 +7,9 @@ VENV_ARCHIVE="$COMFYUI_DIR/archive_name.tar"   # adjust if the tar lives elsewhe
 FILEBROWSER_CONFIG="/root/.config/filebrowser/config.json"
 DB_FILE="/workspace/runpod-slim/filebrowser.db"
 PIP_CONSTRAINT_FILE="/opt/comfyui-runtime-constraints.txt"
+R2_VENV_ARCHIVE="archive_name.tar"             # path of the tar inside the R2 bucket (relative to R2_BUCKET_PATH)
+
+
 
 # ---------------------------------------------------------------------------- #
 #                          Function Definitions                                  #
@@ -170,6 +173,13 @@ hydrate_from_r2() {
             || echo "WARNING: sync of $d failed (continuing)."
     done
 
+    # --- Venv archive: only download if the venv is missing and the tar isn't already here ---
+    if [ ! -d "$VENV_DIR" ] && [ ! -f "$VENV_ARCHIVE" ]; then
+        echo "--> [venv] downloading $R2_VENV_ARCHIVE"
+        rclone copyto "$R2_BASE/$R2_VENV_ARCHIVE" "$VENV_ARCHIVE" "${RCLONE_FLAGS[@]}" \
+            || echo "WARNING: download of $R2_VENV_ARCHIVE failed."
+    fi
+
     echo "R2 hydrate complete."
 }
 
@@ -304,7 +314,11 @@ fi
 
 source "$VENV_DIR/bin/activate"
 
-# ---- R2 hydrate: pull user content ------------------------------------------
+
+# ---- R2 hydrate: pull user content, then install its custom-node deps -------
+# Placed AFTER ComfyUI setup (so the dirs exist and the venv is active) and
+# BEFORE the ComfyUI launch (which blocks on `wait`). The venv is active at
+# this point via one of the branches above.
 hydrate_from_r2
 # -----------------------------------------------------------------------------
 
