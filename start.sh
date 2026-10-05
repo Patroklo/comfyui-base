@@ -2,14 +2,14 @@
 set -e  # Exit the script if any statement returns a non-true return value
 
 COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
+BAKED_COMFYUI_DIR="/opt/comfyui-baked"
+BUNDLE_VERSION_FILE=".runpod-bundle-version"
 VENV_DIR="$COMFYUI_DIR/.venv-cu128"
-VENV_ARCHIVE="$COMFYUI_DIR/archive_name.tar"   # adjust if the tar lives elsewhere
+OLD_VENV_DIR="$COMFYUI_DIR/.venv"
 FILEBROWSER_CONFIG="/root/.config/filebrowser/config.json"
 DB_FILE="/workspace/runpod-slim/filebrowser.db"
 PIP_CONSTRAINT_FILE="/opt/comfyui-runtime-constraints.txt"
-R2_VENV_ARCHIVE="archive_name.tar"             # path of the tar inside the R2 bucket (relative to R2_BUCKET_PATH)
-
-
+BAKED_NODES=("ComfyUI-Manager" "ComfyUI-KJNodes" "Civicomfy" "ComfyUI-RunpodDirect")
 
 # ---------------------------------------------------------------------------- #
 #                          Function Definitions                                  #
@@ -61,7 +61,7 @@ export_env_vars() {
     > "$SSH_ENV_DIR"
     
     # Export to multiple locations for maximum compatibility
-    printenv | grep -E '^RUNPOD_|^R2_|^PATH=|^_=|^CUDA|^LD_LIBRARY_PATH|^PYTHONPATH|^PIP_CONSTRAINT=' | while read -r line; do
+    printenv | grep -E '^RUNPOD_|^PATH=|^_=|^CUDA|^LD_LIBRARY_PATH|^PYTHONPATH|^PIP_CONSTRAINT=' | while read -r line; do
         # Get variable name and value
         name=$(echo "$line" | cut -d= -f1)
         value=$(echo "$line" | cut -d= -f2-)
@@ -115,13 +115,9 @@ hydrate_from_r2() {
     echo "============================================="
 
     if ! command -v rclone >/dev/null 2>&1; then
-        echo "rclone not found — installing via .deb..."
-        curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
-        dpkg -i /tmp/rclone.deb || (apt-get update && apt-get install -f -y /tmp/rclone.deb) || {
-            echo "WARNING: rclone install failed; skipping R2 hydrate."
-            return 0
-        }
-        rm -f /tmp/rclone.deb
+        echo "rclone not found — installing..."
+        curl -fsSL https://rclone.org/install.sh | bash || {
+            echo "WARNING: rclone install failed; skipping R2 hydrate."; return; }
     fi
 
     # Remote defined from env — provider MUST be "Other" for Cloudflare R2
@@ -172,15 +168,31 @@ hydrate_from_r2() {
         rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
             || echo "WARNING: sync of $d failed (continuing)."
     done
+    echo "--> [venv] downloading $R2_VENV_ARCHIVE"
 
-    # --- Venv archive: only download if the venv is missing and the tar isn't already here ---
-    if [ ! -d "$VENV_DIR" ] && [ ! -f "$VENV_ARCHIVE" ]; then
-        echo "--> [venv] downloading $R2_VENV_ARCHIVE"
-        rclone copyto "$R2_BASE/$R2_VENV_ARCHIVE" "$VENV_ARCHIVE" "${RCLONE_FLAGS[@]}" \
+    rclone copyto "$R2_BASE/$R2_VENV_ARCHIVE" "$VENV_ARCHIVE" "${RCLONE_FLAGS[@]}" \
             || echo "WARNING: download of $R2_VENV_ARCHIVE failed."
-    fi
 
     echo "R2 hydrate complete."
+
+    R2_HYDRATED=1
+}
+
+# Install requirements for user custom nodes pulled from R2
+run_node_requirements() {
+    [ "${R2_HYDRATED:-0}" = "1" ] || return
+    echo "Installing requirements for R2-provided custom nodes..."
+    local req node
+    for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
+        [ -f "$req" ] || continue
+        node=$(basename "$(dirname "$req")")
+        case " ${BAKED_NODES[*]} " in
+            *" $node "*) continue ;;
+        esac
+        echo "  - $node"
+        pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    done
+    echo "Custom-node requirements install complete."
 }
 
 # Start Jupyter Lab server for remote access
@@ -199,6 +211,71 @@ start_jupyter() {
         --IdentityProvider.token="${JUPYTER_PASSWORD:-}" \
         --ServerApp.allow_origin=* &> /jupyter.log &
     echo "Jupyter Lab started"
+}
+
+# Upgrade the image-managed ComfyUI files while leaving user data on the
+# persistent workspace untouched.
+upgrade_comfyui_if_needed() {
+    local baked_manifest="$BAKED_COMFYUI_DIR/$BUNDLE_VERSION_FILE"
+    local installed_manifest="$COMFYUI_DIR/$BUNDLE_VERSION_FILE"
+
+    # A missing workspace is handled by the first-time setup below.
+    if [ ! -d "$COMFYUI_DIR" ]; then
+        return
+    fi
+
+    if [ ! -f "$baked_manifest" ]; then
+        echo "WARNING: Baked ComfyUI bundle manifest is missing; skipping upgrade"
+        return
+    fi
+
+    if [ -f "$installed_manifest" ] && cmp -s "$baked_manifest" "$installed_manifest"; then
+        echo "Using existing ComfyUI installation (bundle is current)"
+        return
+    fi
+
+    echo "============================================="
+    echo "  Upgrading ComfyUI workspace from baked bundle"
+    echo "  Preserving models, user data, and custom nodes"
+    echo "============================================="
+
+    # Sync ComfyUI core and remove files that no longer exist in the new
+    # release. Excluded paths belong to the user or are managed separately.
+    rsync -a --delete \
+        --exclude="/$BUNDLE_VERSION_FILE" \
+        --exclude="/.venv*" \
+        --exclude="/models" \
+        --exclude="/input" \
+        --exclude="/output" \
+        --exclude="/user" \
+        --exclude="/custom_nodes" \
+        --exclude="/extra_model_paths.yaml" \
+        "$BAKED_COMFYUI_DIR/" "$COMFYUI_DIR/"
+
+    mkdir -p "$COMFYUI_DIR/custom_nodes"
+
+    # Update files located directly under custom_nodes without deleting
+    # user-provided files or directories.
+    rsync -a --exclude="*/" \
+        "$BAKED_COMFYUI_DIR/custom_nodes/" "$COMFYUI_DIR/custom_nodes/"
+
+    # Image-managed nodes are pinned with the image and must be upgraded.
+    # Other custom-node directories are user-owned and remain untouched.
+    local node
+    for node in "${BAKED_NODES[@]}"; do
+        if [ -d "$BAKED_COMFYUI_DIR/custom_nodes/$node" ]; then
+            mkdir -p "$COMFYUI_DIR/custom_nodes/$node"
+            rsync -a --delete \
+                "$BAKED_COMFYUI_DIR/custom_nodes/$node/" \
+                "$COMFYUI_DIR/custom_nodes/$node/"
+        fi
+    done
+
+    # Write the manifest only after every sync succeeds. An interrupted
+    # migration is retried on the next container start.
+    cp "$baked_manifest" "${installed_manifest}.tmp"
+    mv "${installed_manifest}.tmp" "$installed_manifest"
+    echo "ComfyUI workspace upgraded successfully"
 }
 
 # Install and start Cloudflare Tunnels for Web services
@@ -292,34 +369,78 @@ if [ ! -f "$ARGS_FILE" ]; then
     echo "Created empty ComfyUI arguments file at $ARGS_FILE"
 fi
 
+upgrade_comfyui_if_needed
+
+# Migrate old CUDA 12.4 venv to cu128
+if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
+    NODE_COUNT=$(find "$COMFYUI_DIR/custom_nodes" -maxdepth 2 -name "requirements.txt" 2>/dev/null | wc -l)
+    echo "============================================="
+    echo "  CUDA 12.4 -> 12.8 migration"
+    echo "  Reinstalling deps for $NODE_COUNT custom nodes"
+    echo "  This may take several minutes"
+    echo "============================================="
+    mv "$OLD_VENV_DIR" "${OLD_VENV_DIR}.bak"
+    cd "$COMFYUI_DIR"
+    python3.12 -m venv --system-site-packages "$VENV_DIR"
+    source "$VENV_DIR/bin/activate"
+    python -m ensurepip
+    # Skip nodes baked into the image — their deps are in system site-packages
+    BAKED_NODES_STR="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
+    CURRENT=0
+    INSTALLED=0
+    for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
+        if [ -f "$req" ]; then
+            NODE_NAME=$(basename "$(dirname "$req")")
+            case " $BAKED_NODES_STR " in
+                *" $NODE_NAME "*) continue ;;
+            esac
+            CURRENT=$((CURRENT + 1))
+            echo "[$CURRENT] $NODE_NAME"
+            pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+            INSTALLED=$((INSTALLED + 1))
+        fi
+    done
+    echo "Ensuring ComfyUI requirements are present..."
+    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    echo "Migration complete — $INSTALLED user nodes processed (${NODE_COUNT} total, baked nodes skipped)"
+    echo "Old venv backed up at ${OLD_VENV_DIR}.bak — delete it to free space:"
+    echo "  rm -rf ${OLD_VENV_DIR}.bak"
+fi
+
 # Setup ComfyUI if needed
-if [ ! -d "$COMFYUI_DIR" ]; then
+if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
     echo "First time setup: Copying baked ComfyUI to workspace..."
-    cp -r /opt/comfyui-baked "$COMFYUI_DIR"
-    echo "ComfyUI copied to workspace"
+
+    # Copy baked ComfyUI from image (no git, no network)
+    if [ ! -d "$COMFYUI_DIR" ]; then
+        cp -r /opt/comfyui-baked "$COMFYUI_DIR"
+        echo "ComfyUI copied to workspace"
+    fi
+
+    # Create venv with access to system packages (torch, numpy, etc. pre-installed in image)
+    if [ ! -d "$VENV_DIR" ]; then
+        cd "$COMFYUI_DIR"
+        python3.12 -m venv --system-site-packages "$VENV_DIR"
+        source "$VENV_DIR/bin/activate"
+
+        # Ensure pip is available in the venv (needed for ComfyUI-Manager)
+        python -m ensurepip
+
+        echo "Base packages (torch, numpy, etc.) available from system site-packages"
+        echo "ComfyUI ready — all dependencies pre-installed in image"
+    fi
 else
+    # Just activate the existing venv
+    source "$VENV_DIR/bin/activate"
     echo "Using existing ComfyUI installation"
 fi
-
-# Restore the venv from the archive (no venv creation, no pip installs)
-if [ ! -d "$VENV_DIR" ]; then
-    if [ ! -f "$VENV_ARCHIVE" ]; then
-        echo "ERROR: venv archive not found at $VENV_ARCHIVE"
-        exit 1
-    fi
-    echo "Restoring venv from $VENV_ARCHIVE..."
-    tar -xf "$VENV_ARCHIVE" -C "$COMFYUI_DIR"
-    echo "venv restored"
-fi
-
-source "$VENV_DIR/bin/activate"
-
 
 # ---- R2 hydrate: pull user content, then install its custom-node deps -------
 # Placed AFTER ComfyUI setup (so the dirs exist and the venv is active) and
 # BEFORE the ComfyUI launch (which blocks on `wait`). The venv is active at
 # this point via one of the branches above.
 hydrate_from_r2
+# run_node_requirements
 # -----------------------------------------------------------------------------
 
 # Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
