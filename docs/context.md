@@ -91,6 +91,21 @@ Recognized at runtime by the start scripts:
 - `JUPYTER_PASSWORD` – If set, used as the JupyterLab token (no browser; root at `/workspace`).
 - GPU/CUDA-related environment variables are propagated (`CUDA*`, `LD_LIBRARY_PATH`, `PYTHONPATH`, and `RUNPOD_*` vars if present in the environment).
 
+### Cloudflare R2 sync (optional)
+
+When all three of `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_ENDPOINT` are set, R2 becomes the source of truth for that pod's ComfyUI install — core code, `.venv-cu128`, `models`, `custom_nodes`, and any sibling tool/LoRA dirs, all mirrored as one tree. If any of the three is missing, R2 sync is skipped entirely and the pod behaves exactly as the stock baked-image flow (see Runtime Behavior above).
+
+- `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` – R2 S3-compatible API credentials.
+- `R2_ENDPOINT` – R2 account S3 API endpoint (with or without the `https://` scheme).
+- `R2_BUCKET_PATH` – Bucket/prefix to sync, e.g. `pruebacomfyui/ComfyUi`. Defaults to `pruebacomfyui/ComfyUi` if unset.
+
+Behavior, implemented in `start.sh`:
+
+- **On boot**: the whole `R2_BUCKET_PATH` prefix is pulled into `/workspace/runpod-slim/ComfyUI` in one `rclone copy` (incremental via `--size-only`), *before* the normal "copy baked image + create venv" step — so when R2 supplies `.venv-cu128`, no throwaway local venv is ever created. The stock baked-image upgrade path (`upgrade_comfyui_if_needed`) is skipped whenever R2 is enabled, since it would otherwise overwrite the R2-provided core with the stock image-baked ComfyUI on every restart.
+- **Every 30 minutes**: a background loop pushes local changes back up to the same bucket path (`rclone copy`, non-destructive — files deleted locally are left alone in the bucket). Logged to `/r2-push.log`.
+- **On demand**: run `bash start.sh --push-r2` from inside a live pod (e.g. over SSH) to trigger a one-off push immediately, without touching SSH/FileBrowser/Jupyter/ComfyUI startup.
+- rclone is installed on first use via a `.deb` download if not already present in the image — the one runtime exception to the "no installs at runtime" rule above, since it's fetching a tool, not a Python dependency.
+
 ## Dependency Management
 
 - Python 3.12 is the default interpreter in the image.

@@ -89,37 +89,40 @@ export_env_vars() {
 }
 
 # ---------------------------------------------------------------------------- #
-#  Hydrate content from Cloudflare R2.                                          #
+#  Cloudflare R2 content sync (both directions).                               #
 #                                                                              #
-#  The bucket is a FULL ComfyUI checkout plus extra tools, so we DON'T pull    #
-#  "everything minus core" (root files like main.py would clobber the image's  #
-#  ComfyUI). Instead we pull two explicit lists:                               #
-#    - COMFY_DATA_DIRS  -> into the ComfyUI dir (models, custom_nodes, ...)     #
-#    - SIBLING_DIRS     -> into /workspace/runpod-slim (standalone tools/LoRAs) #
-#  Add new folders to SIBLING_DIRS as you create them in the bucket.           #
+#  The bucket is a FULL ComfyUI checkout (core code, .venv-cu128, models,       #
+#  custom_nodes, and sibling tool/LoRA dirs all under one prefix). We mirror    #
+#  the whole prefix in or out as a single rclone copy — no per-folder lists.   #
 # ---------------------------------------------------------------------------- #
-hydrate_from_r2() {
-    # Accept bare or -prefixed names.
-    local R2_KEY="${R2_ACCESS_KEY_ID:-${R2_ACCESS_KEY_ID:-}}"
-    local R2_SECRET="${R2_SECRET_ACCESS_KEY:-${R2_SECRET_ACCESS_KEY:-}}"
-    local R2_END="${R2_ENDPOINT:-${R2_ENDPOINT:-}}"
-    local R2_PATH="${R2_BUCKET_PATH:-${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}}"
+
+# Shared rclone transfer flags for both hydrate (R2 -> pod) and push (pod -> R2).
+R2_SYNC_FLAGS=(-P --transfers 16 --checkers 32 \
+    --multi-thread-streams 8 --multi-thread-cutoff 50M \
+    --s3-chunk-size 64M --s3-upload-concurrency 8 \
+    --fast-list --size-only \
+    --exclude "/.git/**" --exclude "/.github/**" --exclude "/.ci/**" \
+    --exclude "**/__pycache__/**")
+
+# Configure the rclone remote from R2_* env vars and set $R2_BASE / $R2_PATH.
+# Returns 1 (no output of its own) when R2 isn't configured, so callers can
+# decide what to log. Installs rclone on demand if it's missing.
+r2_configure() {
+    local R2_KEY="${R2_ACCESS_KEY_ID:-}"
+    local R2_SECRET="${R2_SECRET_ACCESS_KEY:-}"
+    local R2_END="${R2_ENDPOINT:-}"
+    R2_PATH="${R2_BUCKET_PATH:-pruebacomfyui/ComfyUi}"
 
     if [ -z "$R2_KEY" ] || [ -z "$R2_SECRET" ] || [ -z "$R2_END" ]; then
-        echo "R2 env vars not set — skipping R2 hydrate (stock behaviour)."
-        return
+        return 1
     fi
-
-    echo "============================================="
-    echo "  Hydrating content from Cloudflare R2"
-    echo "============================================="
 
     if ! command -v rclone >/dev/null 2>&1; then
         echo "rclone not found — installing via .deb..."
         curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
         dpkg -i /tmp/rclone.deb || (apt-get update && apt-get install -f -y /tmp/rclone.deb) || {
-            echo "WARNING: rclone install failed; skipping R2 hydrate."
-            return 0
+            echo "WARNING: rclone install failed."
+            return 1
         }
         rm -f /tmp/rclone.deb
     fi
@@ -136,45 +139,71 @@ hydrate_from_r2() {
 
     # strip any scheme from the endpoint for connection-string form
     local EP="${R2_END#https://}"; EP="${EP#http://}"
-    local R2_BASE=":s3,provider=Other,access_key_id=${R2_KEY},secret_access_key=${R2_SECRET},endpoint=${EP}:${R2_PATH}"
-    echo "R2 base: $R2_BASE"
+    R2_BASE=":s3,provider=Other,access_key_id=${R2_KEY},secret_access_key=${R2_SECRET},endpoint=${EP}:${R2_PATH}"
+    return 0
+}
+
+# Pull the bucket down into $COMFYUI_DIR (R2 -> pod).
+hydrate_from_r2() {
+    r2_configure || { echo "R2 env vars not set — skipping R2 hydrate (stock behaviour)."; return; }
+
+    echo "============================================="
+    echo "  Hydrating content from Cloudflare R2"
+    echo "============================================="
+    echo "R2 target: $R2_PATH"
 
     if ! rclone lsd "$R2_BASE/" >/dev/null 2>&1; then
-        echo "WARNING: cannot list $R2_BASE — check keys/endpoint/path. Error:"
-        rclone lsd "$R2_BASE/" || true
+        echo "WARNING: cannot list $R2_PATH — check keys/endpoint/path. Error:"
+        rclone lsd "$R2_BASE/" 2>&1 | sed -E 's#(access_key_id|secret_access_key)=[^,:]*#\1=***REDACTED***#g' || true
         return
     fi
 
-    local RCLONE_FLAGS=(-P --transfers 16 --checkers 32 \
-        --multi-thread-streams 8 --multi-thread-cutoff 50M \
-        --s3-chunk-size 64M --s3-upload-concurrency 8 \
-        --fast-list --size-only \
-        --exclude "**/__pycache__/**" --exclude "*/.git/**")
-
-    # --- ComfyUI data dirs -> into the ComfyUI dir ---
-    local COMFY_DATA_DIRS=("models" "custom_nodes" "user" "input" "output")
-    local d
-    for d in "${COMFY_DATA_DIRS[@]}"; do
-        echo "--> [ComfyUI] $d"
-        mkdir -p "$COMFYUI_DIR/$d"
-        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
-            || echo "WARNING: sync of $d failed (continuing)."
-    done
-
-    # --- Standalone tools / LoRA dirs -> siblings of ComfyUI ---
-    # Add new top-level bucket folders here as you create them.
-    local SIBLING_DIRS=("ai-toolkit" "musubi-tuner" "chica_prueba_2_lora" "hombre_prueba_2_lora" "sd-scripts")
-    local base_dir
-    base_dir="$(dirname "$COMFYUI_DIR")"   # /workspace/runpod-slim
-    for d in "${SIBLING_DIRS[@]}"; do
-        echo "--> [sibling] $d"
-        mkdir -p "$COMFYUI_DIR/$d"
-        rclone copy "$R2_BASE/$d/" "$COMFYUI_DIR/$d/" "${RCLONE_FLAGS[@]}" \
-            || echo "WARNING: sync of $d failed (continuing)."
-    done
+    mkdir -p "$COMFYUI_DIR"
+    echo "--> Mirroring $R2_PATH -> $COMFYUI_DIR"
+    rclone copy "$R2_BASE/" "$COMFYUI_DIR/" "${R2_SYNC_FLAGS[@]}" \
+        || { echo "WARNING: R2 hydrate failed (continuing)."; return; }
 
     echo "R2 hydrate complete."
     R2_HYDRATED=1
+}
+
+# Push local workspace changes up to the bucket (pod -> R2). Non-destructive:
+# uses `rclone copy`, so files deleted locally are left alone in the bucket.
+push_to_r2() {
+    r2_configure || { echo "R2 env vars not set — skipping R2 push."; return 1; }
+
+    if [ ! -d "$COMFYUI_DIR" ]; then
+        echo "WARNING: $COMFYUI_DIR does not exist yet — nothing to push."
+        return 1
+    fi
+
+    echo "============================================="
+    echo "  Pushing local changes to Cloudflare R2"
+    echo "============================================="
+    echo "R2 target: $R2_PATH"
+
+    rclone copy "$COMFYUI_DIR/" "$R2_BASE/" "${R2_SYNC_FLAGS[@]}" \
+        || { echo "WARNING: R2 push failed."; return 1; }
+
+    echo "R2 push complete."
+}
+
+# Background loop: push local changes to R2 every 30 minutes. Only started
+# when R2 is configured (checked by the caller via $R2_ENABLED).
+start_periodic_r2_push() {
+    (
+        # set -e is inherited from the parent script; without this, a single
+        # failed push (non-zero return from push_to_r2) would kill this
+        # subshell and silently end the periodic sync for the rest of the
+        # pod's life. +e keeps the loop alive across failures.
+        set +e
+        while true; do
+            sleep 1800
+            echo "[r2-push] periodic sync starting..."
+            push_to_r2 || echo "[r2-push] push failed — will retry in 30m"
+        done
+    ) &> /r2-push.log &
+    echo "Periodic R2 push scheduled every 30 minutes (PID $!, log: /r2-push.log)"
 }
 
 # Install requirements for user custom nodes pulled from R2
@@ -327,11 +356,34 @@ setup_cloudflare_tunnels() {
     echo "  📁 FileBrowser:     $FILEBROWSER_CF_URL"
     echo "  💻 Console/Jupyter: $JUPYTER_CF_URL"
     echo "================================================================="
+
+    # Mirror the same URLs to a file on the persistent workspace, overwriting
+    # any URLs left over from a previous boot (tunnels are regenerated every
+    # start, so stale entries would otherwise point nowhere).
+    local tunnel_file="/workspace/runpod-slim/tunnel_urls.txt"
+    {
+        echo "================================================================="
+        echo "                  CLOUDFLARE TUNNEL URLS                         "
+        echo "================================================================="
+        echo "  🎨 ComfyUI:         $COMFY_CF_URL"
+        echo "  📁 FileBrowser:     $FILEBROWSER_CF_URL"
+        echo "  💻 Console/Jupyter: $JUPYTER_CF_URL"
+        echo "================================================================="
+    } > "$tunnel_file"
 }
 
 # ---------------------------------------------------------------------------- #
 #                               Main Program                                     #
 # ---------------------------------------------------------------------------- #
+
+# Manual one-off push: `start.sh --push-r2` runs just the R2 push and exits,
+# without touching SSH/FileBrowser/Jupyter/ComfyUI. Useful to trigger a sync
+# on demand from inside a running pod (e.g. via SSH) between the automatic
+# 30-minute pushes.
+if [ "${1:-}" = "--push-r2" ]; then
+    push_to_r2
+    exit $?
+fi
 
 # Setup environment
 if [ -f "$PIP_CONSTRAINT_FILE" ]; then
@@ -368,7 +420,18 @@ if [ ! -f "$ARGS_FILE" ]; then
     echo "Created empty ComfyUI arguments file at $ARGS_FILE"
 fi
 
-upgrade_comfyui_if_needed
+# Detect whether R2 hydrate is configured. When it is, R2 is the source of
+# truth for ComfyUI core + venv + models + custom nodes, so we skip the
+# baked-image upgrade path (it would otherwise overwrite the R2-provided
+# core with the stock image-baked ComfyUI on every restart).
+R2_ENABLED=0
+if [ -n "$R2_ACCESS_KEY_ID" ] && [ -n "$R2_SECRET_ACCESS_KEY" ] && [ -n "$R2_ENDPOINT" ]; then
+    R2_ENABLED=1
+fi
+
+if [ "$R2_ENABLED" = "0" ]; then
+    upgrade_comfyui_if_needed
+fi
 
 # Migrate old CUDA 12.4 venv to cu128
 if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
@@ -406,6 +469,15 @@ if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
     echo "  rm -rf ${OLD_VENV_DIR}.bak"
 fi
 
+# ---- R2 hydrate: pull ComfyUI core + venv + models + custom nodes ----------
+# Placed BEFORE the "Setup ComfyUI if needed" block below, so that when R2 is
+# configured it populates $COMFYUI_DIR and $VENV_DIR directly from the
+# bucket — the block below then finds both already present and just
+# activates the venv, instead of copying the baked image and building a
+# throwaway venv first.
+hydrate_from_r2
+# -----------------------------------------------------------------------------
+
 # Setup ComfyUI if needed
 if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
     echo "First time setup: Copying baked ComfyUI to workspace..."
@@ -434,13 +506,15 @@ else
     echo "Using existing ComfyUI installation"
 fi
 
-# ---- R2 hydrate: pull user content, then install its custom-node deps -------
-# Placed AFTER ComfyUI setup (so the dirs exist and the venv is active) and
-# BEFORE the ComfyUI launch (which blocks on `wait`). The venv is active at
-# this point via one of the branches above.
-hydrate_from_r2
+# Install requirements for any R2-provided custom node not already covered
+# by the active venv. Runs after the venv is guaranteed to be activated.
 run_node_requirements
-# -----------------------------------------------------------------------------
+
+# Schedule the automatic push-to-R2 loop (every 30 min). Only when R2 is
+# actually configured — mirrors the hydrate-side $R2_ENABLED gate above.
+if [ "$R2_ENABLED" = "1" ]; then
+    start_periodic_r2_push
+fi
 
 # Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
 python -m pip --version > /dev/null 2>&1
