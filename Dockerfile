@@ -236,6 +236,7 @@ EXPOSE 8188 22 8888 8080
 
 # Copy start script
 COPY start.sh /start.sh
+RUN chmod +x /start.sh
 
 # Set Python 3.12 as default
 RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
