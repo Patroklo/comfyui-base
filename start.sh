@@ -206,10 +206,12 @@ start_periodic_r2_push() {
     echo "Periodic R2 push scheduled every 30 minutes (PID $!, log: /r2-push.log)"
 }
 
-# Install requirements for user custom nodes pulled from R2
+# Install requirements for every non-baked custom node (baked nodes get their
+# deps from system site-packages, already installed at image build time — the
+# case statement below skips them). Safe to call any time the venv is active;
+# a no-op when custom_nodes only contains baked nodes.
 run_node_requirements() {
-    [ "${R2_HYDRATED:-0}" = "1" ] || return
-    echo "Installing requirements for R2-provided custom nodes..."
+    echo "Installing requirements for non-baked custom nodes..."
     local req node
     for req in "$COMFYUI_DIR"/custom_nodes/*/requirements.txt; do
         [ -f "$req" ] || continue
@@ -221,6 +223,29 @@ run_node_requirements() {
         pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     done
     echo "Custom-node requirements install complete."
+}
+
+# Manual, full reinstall of everything in $VENV_DIR: ComfyUI's own
+# requirements.txt plus every non-baked custom node's requirements.txt.
+# Triggered via `start.sh --reinstall-deps`. Requires the venv to already
+# exist (boot the pod normally first if it doesn't).
+reinstall_venv_deps() {
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "ERROR: $VENV_DIR does not exist yet — boot the pod normally first."
+        return 1
+    fi
+
+    source "$VENV_DIR/bin/activate"
+    echo "============================================="
+    echo "  Reinstalling all pip packages in $VENV_DIR"
+    echo "============================================="
+
+    echo "Reinstalling ComfyUI core requirements..."
+    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+
+    run_node_requirements
+
+    echo "Reinstall complete."
 }
 
 # Start Jupyter Lab server for remote access
@@ -385,6 +410,14 @@ if [ "${1:-}" = "--push-r2" ]; then
     exit $?
 fi
 
+# Manual full reinstall: `start.sh --reinstall-deps` reinstalls ComfyUI core
+# + every non-baked custom node's requirements into the existing venv, then
+# exits — same scope as --push-r2, no SSH/FileBrowser/Jupyter/ComfyUI startup.
+if [ "${1:-}" = "--reinstall-deps" ]; then
+    reinstall_venv_deps
+    exit $?
+fi
+
 # Setup environment
 if [ -f "$PIP_CONSTRAINT_FILE" ]; then
     export PIP_CONSTRAINT="$PIP_CONSTRAINT_FILE"
@@ -499,16 +532,18 @@ if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
 
         echo "Base packages (torch, numpy, etc.) available from system site-packages"
         echo "ComfyUI ready — all dependencies pre-installed in image"
+
+        # This venv is brand new (system site-packages only), so any
+        # R2-provided custom node needs its requirements installed here.
+        # Not needed on later boots, where R2 already ships a populated
+        # .venv-cu128 and this would just be a redundant no-op sweep.
+        run_node_requirements
     fi
 else
     # Just activate the existing venv
     source "$VENV_DIR/bin/activate"
     echo "Using existing ComfyUI installation"
 fi
-
-# Install requirements for any R2-provided custom node not already covered
-# by the active venv. Runs after the venv is guaranteed to be activated.
-run_node_requirements
 
 # Schedule the automatic push-to-R2 loop (every 30 min). Only when R2 is
 # actually configured — mirrors the hydrate-side $R2_ENABLED gate above.

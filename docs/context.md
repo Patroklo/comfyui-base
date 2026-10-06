@@ -105,6 +105,16 @@ Behavior, implemented in `start.sh`:
 - **Every 30 minutes**: a background loop pushes local changes back up to the same bucket path (`rclone copy`, non-destructive — files deleted locally are left alone in the bucket). Logged to `/r2-push.log`.
 - **On demand**: run `bash start.sh --push-r2` from inside a live pod (e.g. over SSH) to trigger a one-off push immediately, without touching SSH/FileBrowser/Jupyter/ComfyUI startup.
 - rclone is installed on first use via a `.deb` download if not already present in the image — the one runtime exception to the "no installs at runtime" rule above, since it's fetching a tool, not a Python dependency.
+- Non-baked custom node requirements (`run_node_requirements`) are only pip-installed when a **brand new, empty** `.venv-cu128` gets created (true first boot, or any boot where R2 didn't supply a venv) — not on every boot, since a venv pulled whole from R2 already has everything installed.
+
+### Manual `start.sh` flags
+
+Both exit immediately after running — neither starts SSH/FileBrowser/Jupyter/ComfyUI:
+
+| Command | Does |
+|---|---|
+| `bash start.sh --push-r2` | One-off push of local changes up to the R2 bucket (same as the automatic 30-min loop). |
+| `bash start.sh --reinstall-deps` | Reinstalls ComfyUI core `requirements.txt` + every non-baked custom node's `requirements.txt` into the existing `.venv-cu128`. Errors out if the venv doesn't exist yet (boot normally first). |
 
 ## Dependency Management
 
