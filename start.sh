@@ -551,8 +551,14 @@ if [ "$R2_ENABLED" = "1" ]; then
     start_periodic_r2_push
 fi
 
-# Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
-python -m pip --version > /dev/null 2>&1
+# Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start.
+# Never let this line kill the boot via set -e: if the R2-hydrated venv is
+# broken (stale absolute paths from a different image build), log it instead
+# of silently crash-looping the whole container.
+if ! python -m pip --version > /pip-warmup.log 2>&1; then
+    echo "WARNING: 'python -m pip --version' failed — venv may be broken. See /pip-warmup.log:"
+    cat /pip-warmup.log
+fi
 
 # Start ComfyUI — keep container alive if it crashes so SSH/Jupyter remain accessible
 cd $COMFYUI_DIR
