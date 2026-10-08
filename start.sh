@@ -100,7 +100,7 @@ export_env_vars() {
 R2_SYNC_FLAGS=(-P --transfers 16 --checkers 32 \
     --multi-thread-streams 8 --multi-thread-cutoff 50M \
     --s3-chunk-size 64M --s3-upload-concurrency 8 \
-    --fast-list --size-only \
+    --fast-list --size-only --links \
     --exclude "/.git/**" --exclude "/.github/**" --exclude "/.ci/**" \
     --exclude "**/__pycache__/**")
 
@@ -246,6 +246,29 @@ reinstall_venv_deps() {
     run_node_requirements
 
     echo "Reinstall complete."
+}
+
+# A venv's bin/python, bin/python3, bin/pythonX.Y are normally symlinks to the
+# base interpreter. R2_SYNC_FLAGS didn't carry --links until this fix, so any
+# venv pushed before then is missing those symlinks in the bucket — hydrating
+# it back down leaves `activate` succeeding but no interpreter on PATH at all.
+# Recreate them from the image's own python3.12 if that happens.
+repair_venv_python_symlinks() {
+    if command -v python >/dev/null 2>&1; then
+        return
+    fi
+
+    if [ -z "$SYSTEM_PYTHON312" ]; then
+        echo "ERROR: venv has no python and no system python3.12 was found to repair it with."
+        return 1
+    fi
+
+    echo "WARNING: venv at $VENV_DIR is missing its python symlinks (likely stripped by an" \
+         "older R2 sync) — repairing from $SYSTEM_PYTHON312"
+    local name
+    for name in python python3 python3.12; do
+        ln -sf "$SYSTEM_PYTHON312" "$VENV_DIR/bin/$name"
+    done
 }
 
 # Start Jupyter Lab server for remote access
@@ -424,6 +447,10 @@ if [ -f "$PIP_CONSTRAINT_FILE" ]; then
     echo "Using runtime pip constraints from $PIP_CONSTRAINT_FILE"
 fi
 
+# Resolved before any venv's bin/ is prepended to PATH, so it always points at
+# the image's base interpreter regardless of what's in the venv.
+SYSTEM_PYTHON312="$(command -v python3.12 || true)"
+
 setup_ssh
 export_env_vars
 
@@ -542,6 +569,7 @@ if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
 else
     # Just activate the existing venv
     source "$VENV_DIR/bin/activate"
+    repair_venv_python_symlinks
     echo "Using existing ComfyUI installation"
 fi
 
