@@ -271,6 +271,26 @@ repair_venv_python_symlinks() {
     done
 }
 
+# On some RunPod hosts the GPU device nodes aren't fully bound into the
+# container the instant it starts, so launching ComfyUI immediately after boot
+# can hit "CUDA unknown error" even though the GPU is healthy moments later.
+# Poll nvidia-smi briefly before starting ComfyUI; a pod with no GPU at all
+# (nvidia-smi missing) falls through immediately rather than waiting it out.
+wait_for_gpu() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        return
+    fi
+
+    local i
+    for i in $(seq 1 15); do
+        if nvidia-smi >/dev/null 2>&1; then
+            return
+        fi
+        sleep 2
+    done
+    echo "WARNING: nvidia-smi still not ready after 30s — starting ComfyUI anyway."
+}
+
 # Start Jupyter Lab server for remote access
 start_jupyter() {
     mkdir -p /workspace
@@ -597,6 +617,8 @@ if [ -s "$ARGS_FILE" ]; then
         FIXED_ARGS="$FIXED_ARGS $CUSTOM_ARGS"
     fi
 fi
+
+wait_for_gpu
 
 echo "Starting ComfyUI with args: $FIXED_ARGS"
 python main.py $FIXED_ARGS &
