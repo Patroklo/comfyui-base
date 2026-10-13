@@ -220,7 +220,7 @@ run_node_requirements() {
             *" $node "*) continue ;;
         esac
         echo "  - $node"
-        pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+        pip install --no-build-isolation -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     done
     echo "Custom-node requirements install complete."
 }
@@ -241,7 +241,7 @@ reinstall_venv_deps() {
     echo "============================================="
 
     echo "Reinstalling ComfyUI core requirements..."
-    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    pip install --no-build-isolation -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
 
     run_node_requirements
 
@@ -491,12 +491,12 @@ if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
             esac
             CURRENT=$((CURRENT + 1))
             echo "[$CURRENT] $NODE_NAME"
-            pip install -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+            pip install --no-build-isolation -r "$req" 2>&1 | grep -E "^(Successfully|ERROR)" || true
             INSTALLED=$((INSTALLED + 1))
         fi
     done
     echo "Ensuring ComfyUI requirements are present..."
-    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    pip install --no-build-isolation -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     echo "Migration complete — $INSTALLED user nodes processed (${NODE_COUNT} total, baked nodes skipped)"
     echo "Old venv backed up at ${OLD_VENV_DIR}.bak — delete it to free space:"
     echo "  rm -rf ${OLD_VENV_DIR}.bak"
@@ -553,7 +553,7 @@ if [ "${R2_HYDRATED:-0}" = "1" ]; then
     echo "  Syncing pip packages after R2 hydrate"
     echo "============================================="
     echo "Installing ComfyUI core requirements..."
-    pip install -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    pip install --no-build-isolation -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     run_node_requirements
 fi
 
