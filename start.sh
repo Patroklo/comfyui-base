@@ -349,6 +349,26 @@ repair_venv() {
     chmod +x "$VENV_DIR"/bin/* 2>/dev/null || true
 }
 
+# Custom-node requirements fight over two packages on every sync:
+#  - `onnxruntime` (CPU) vs `onnxruntime-gpu`: they share the same module dir,
+#    and nodes asking for plain `onnxruntime` reinstall the CPU build over the
+#    GPU one. Nodes (DWPose, WD14 tagger, reactor...) then silently run on CPU.
+#  - `protobuf`: one node pins 5.x, but onnx needs >= 6.31.1 (PuLID nodes then
+#    fail to import).
+# Re-assert the wanted state after the sync; no-op when already correct.
+fix_conflicting_packages() {
+    echo "Checking onnxruntime GPU provider / protobuf..."
+    if ! $PYTHON_BIN -c "import onnxruntime as o, sys; sys.exit(0 if 'CUDAExecutionProvider' in o.get_available_providers() else 1)" 2>/dev/null; then
+        echo "  onnxruntime has no CUDA provider — reinstalling onnxruntime-gpu only"
+        pip uninstall -y onnxruntime onnxruntime-gpu 2>&1 | grep -E "^(Successfully|ERROR)" || true
+        pip install onnxruntime-gpu 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    fi
+    if ! $PYTHON_BIN -c "import google.protobuf as p, sys; from packaging.version import Version as V; sys.exit(0 if V(p.__version__) >= V('6.31.1') else 1)" 2>/dev/null; then
+        echo "  protobuf too old for onnx — upgrading"
+        pip install "protobuf>=6.31.1" 2>&1 | grep -E "^(Successfully|ERROR)" || true
+    fi
+}
+
 # Pick the interpreter to use: `python` if it exists on PATH, else `python3`.
 # Call after activating the venv — a venv restored from R2 may lack `python`.
 detect_python() {
@@ -587,6 +607,8 @@ if [ "${R2_HYDRATED:-0}" = "1" ]; then
     echo "Installing ComfyUI core requirements..."
     pip install --no-build-isolation -r "$COMFYUI_DIR/requirements.txt" 2>&1 | grep -E "^(Successfully|ERROR)" || true
     run_node_requirements
+    detect_python
+    fix_conflicting_packages
 fi
 
 # Schedule the automatic push-to-R2 loop (every 30 min). Only when R2 is
