@@ -1,6 +1,10 @@
 #!/bin/bash
 set -e  # Exit the script if any statement returns a non-true return value
 
+# Debug traces: show which command tripped `set -e` and the final exit code.
+trap 'echo "[debug] ERR: exit $? at line $LINENO: $BASH_COMMAND"' ERR
+trap 'echo "[debug] EXIT: code $?"' EXIT
+
 COMFYUI_DIR="/workspace/runpod-slim/ComfyUI"
 BAKED_COMFYUI_DIR="/opt/comfyui-baked"
 BUNDLE_VERSION_FILE=".runpod-bundle-version"
@@ -564,7 +568,7 @@ if [ "$R2_ENABLED" = "1" ]; then
 fi
 
 # Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
-python -m pip --version > /dev/null 2>&1
+python -m pip --version || echo "WARNING: 'python -m pip --version' failed — continuing anyway"
 
 # Start ComfyUI — keep container alive if it crashes so SSH/Jupyter remain accessible
 cd $COMFYUI_DIR
