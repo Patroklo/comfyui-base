@@ -335,6 +335,17 @@ upgrade_comfyui_if_needed() {
     echo "ComfyUI workspace upgraded successfully"
 }
 
+# Pick the interpreter to use: `python` if it exists on PATH, else `python3`.
+# Call after activating the venv — a venv restored from R2 may lack `python`.
+detect_python() {
+    if command -v python >/dev/null 2>&1; then
+        PYTHON_BIN=python
+    else
+        PYTHON_BIN=python3
+        echo "WARNING: 'python' not found in PATH — using python3"
+    fi
+}
+
 # Install and start Cloudflare Tunnels for Web services
 setup_cloudflare_tunnels() {
     echo "============================================="
@@ -482,7 +493,8 @@ if [ -d "$OLD_VENV_DIR" ] && [ ! -d "$VENV_DIR" ]; then
     cd "$COMFYUI_DIR"
     python3.12 -m venv --system-site-packages "$VENV_DIR"
     source "$VENV_DIR/bin/activate"
-    python -m ensurepip
+    detect_python
+    $PYTHON_BIN -m ensurepip
     # Skip nodes baked into the image — their deps are in system site-packages
     BAKED_NODES_STR="ComfyUI-Manager ComfyUI-KJNodes Civicomfy ComfyUI-RunpodDirect"
     CURRENT=0
@@ -532,7 +544,8 @@ if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
         source "$VENV_DIR/bin/activate"
 
         # Ensure pip is available in the venv (needed for ComfyUI-Manager)
-        python -m ensurepip
+        detect_python
+        $PYTHON_BIN -m ensurepip
 
         echo "Base packages (torch, numpy, etc.) available from system site-packages"
         echo "ComfyUI ready — all dependencies pre-installed in image"
@@ -568,7 +581,9 @@ if [ "$R2_ENABLED" = "1" ]; then
 fi
 
 # Warm up pip so ComfyUI-Manager's 5s timeout check doesn't fail on cold start
-python -m pip --version || echo "WARNING: 'python -m pip --version' failed — continuing anyway"
+detect_python
+echo "Using interpreter: $(command -v $PYTHON_BIN)"
+$PYTHON_BIN -m pip --version || echo "WARNING: '$PYTHON_BIN -m pip --version' failed — continuing anyway"
 
 # Start ComfyUI — keep container alive if it crashes so SSH/Jupyter remain accessible
 cd $COMFYUI_DIR
@@ -581,7 +596,7 @@ if [ -s "$ARGS_FILE" ]; then
 fi
 
 echo "Starting ComfyUI with args: $FIXED_ARGS"
-python main.py $FIXED_ARGS &
+$PYTHON_BIN main.py $FIXED_ARGS &
 COMFY_PID=$!
 trap "kill $COMFY_PID 2>/dev/null" SIGTERM SIGINT
 
@@ -595,7 +610,7 @@ echo "  ComfyUI crashed — check the logs above."
 echo "  SSH and JupyterLab are still available."
 echo "  To restart after fixing:"
 echo "    cd $COMFYUI_DIR && source .venv-cu128/bin/activate"
-echo "    python main.py $FIXED_ARGS"
+echo "    $PYTHON_BIN main.py $FIXED_ARGS"
 echo "============================================="
 
 sleep infinity
