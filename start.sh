@@ -335,6 +335,20 @@ upgrade_comfyui_if_needed() {
     echo "ComfyUI workspace upgraded successfully"
 }
 
+# rclone doesn't preserve symlinks or exec bits, so a venv restored from R2 has
+# no bin/python* entries and non-executable console scripts (pip, ...). Without
+# this, `pip`/`python` silently resolve to the SYSTEM interpreter and packages
+# get installed outside the venv. Re-running `venv` over the existing dir
+# recreates the symlinks and keeps the installed site-packages.
+repair_venv() {
+    if [ ! -x "$VENV_DIR/bin/python" ]; then
+        echo "Repairing venv restored from R2 (missing python symlinks)..."
+        python3.12 -m venv --system-site-packages "$VENV_DIR" \
+            || echo "WARNING: venv repair failed"
+    fi
+    chmod +x "$VENV_DIR"/bin/* 2>/dev/null || true
+}
+
 # Pick the interpreter to use: `python` if it exists on PATH, else `python3`.
 # Call after activating the venv — a venv restored from R2 may lack `python`.
 detect_python() {
@@ -557,7 +571,8 @@ if [ ! -d "$COMFYUI_DIR" ] || [ ! -d "$VENV_DIR" ]; then
         run_node_requirements
     fi
 else
-    # Just activate the existing venv
+    # Just activate the existing venv (repairing it first if it came from R2)
+    repair_venv
     source "$VENV_DIR/bin/activate"
     echo "Using existing ComfyUI installation"
 fi
