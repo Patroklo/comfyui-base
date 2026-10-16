@@ -495,6 +495,29 @@ nohup filebrowser &> /filebrowser.log &
 
 start_jupyter
 
+# Fail fast on a broken GPU host (e.g. "CUDA unknown error") before the long
+# R2 sync / dependency install. SSH, Jupyter and FileBrowser stay up so the
+# pod can be inspected. Set SKIP_GPU_CHECK=1 to bypass.
+if [ "${SKIP_GPU_CHECK:-0}" != "1" ] && command -v nvidia-smi >/dev/null 2>&1; then
+    echo "Checking GPU / CUDA..."
+    if GPU_CHECK_OUT=$(python3.12 -c "import torch; torch.zeros(1).cuda(); print(torch.cuda.get_device_name(0))" 2>&1); then
+        echo "GPU OK: $(echo "$GPU_CHECK_OUT" | tail -n 1)"
+    else
+        echo "============================================="
+        echo "  GPU CHECK FAILED — torch cannot initialise CUDA"
+        echo "  This is usually a bad host. Terminate this pod and"
+        echo "  redeploy on another machine / GPU type."
+        echo "---------------------------------------------"
+        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 || true
+        echo "$GPU_CHECK_OUT" | tail -n 5
+        echo "  SSH, JupyterLab and FileBrowser are still available."
+        echo "  Set SKIP_GPU_CHECK=1 to bypass this check."
+        echo "============================================="
+        setup_cloudflare_tunnels || true
+        sleep infinity
+    fi
+fi
+
 # Create default comfyui_args.txt if it doesn't exist
 ARGS_FILE="/workspace/runpod-slim/comfyui_args.txt"
 if [ ! -f "$ARGS_FILE" ]; then
